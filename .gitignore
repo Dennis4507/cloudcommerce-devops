@@ -15,11 +15,14 @@ ansible/inventory/hosts
 # Secrets & credentials - NEVER commit these
 *.pem
 *.key
+*.csv
 .env
 .env.*
 credentials
 secrets.json
 secrets.yaml
+*accessKeys*
+*credentials*
 
 # OS files
 .DS_Store
