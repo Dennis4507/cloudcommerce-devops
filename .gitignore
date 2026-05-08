@@ -1,0 +1,30 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+*.tfvars
+*.auto.tfvars
+crash.log
+override.tf
+
+# Ansible
+*.retry
+ansible/inventory/hosts
+
+# Secrets & credentials - NEVER commit these
+*.pem
+*.key
+.env
+.env.*
+credentials
+secrets.json
+secrets.yaml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+*.swp
