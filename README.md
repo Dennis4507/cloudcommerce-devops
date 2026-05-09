@@ -65,7 +65,17 @@ Developer pushes code to GitHub
 
 ## Project Phases
 
-- [x] Phase 1 — Foundation: Terraform infrastructure + Ansible + k3s cluster
+- [ ] Phase 1 — Foundation: Terraform infrastructure + Ansible + k3s cluster
+  - [x] Repository structure created
+  - [x] AWS IAM user group and dedicated project user configured
+  - [x] AWS CLI named profile configured (cloudcommerce → eu-central-1)
+  - [x] S3 remote state bucket created (versioning + SSE-S3 encryption enabled)
+  - [x] Terraform backend, variables, main, and outputs files created
+  - [ ] VPC module — network foundation
+  - [ ] IAM module — roles and instance profiles
+  - [ ] ECR module — container registries
+  - [ ] Compute module — Jenkins and k3s EC2 instances
+  - [ ] Ansible — server configuration and k3s install
 - [ ] Phase 2 — CI/CD: Jenkins pipeline + ArgoCD GitOps
 - [ ] Phase 3 — Kubernetes: Helm deploy + Ingress + HPA + RBAC
 - [ ] Phase 4 — Observability: Prometheus + Grafana + Loki + AlertManager
@@ -126,19 +136,43 @@ cloudcommerce-devops/
 
 ## Screenshots
 
-*Added progressively as each phase is completed.*
+### Phase 1 — Foundation Setup
 
-### Live Application
-<!-- screenshot: online boutique running in browser with your domain -->
+**GitHub Repository**
+![GitHub repo README](docs/screenshots/01-github-repo-readme.png)
+*Project repository with full README rendered on GitHub*
 
-### Jenkins Pipeline
-<!-- screenshot: successful pipeline run showing all green stages -->
+**AWS IAM — User Group**
+![IAM user group](docs/screenshots/02-iam-user-group.png)
+*cloudcommerce-admins group with AdministratorAccess policy attached*
 
-### ArgoCD
+**AWS IAM — Dedicated Project User**
+![IAM user](docs/screenshots/03-iam-user.png)
+*cloudcommerce-devops IAM user — isolated credentials for this project only*
+
+**AWS S3 — Terraform State Bucket (Versioning)**
+![S3 bucket versioning](docs/screenshots/04-s3-tfstate-bucket.png)
+*S3 remote state bucket with versioning enabled — allows state rollback if corrupted*
+
+**AWS S3 — Terraform State Bucket (Encryption)**
+![S3 bucket encryption](docs/screenshots/04-s3-tfstate-bucket1.png)
+*SSE-S3 encryption enabled — state file encrypted at rest in S3*
+
+**Project Structure**
+![VS Code project structure](docs/screenshots/05-project-structure.png)
+*Full repository structure in VS Code — terraform, ansible, kubernetes, jenkins layers*
+
+### Phase 2 — CI/CD Pipeline
+<!-- screenshot: Jenkins pipeline run showing all green stages -->
+
+### Phase 3 — Kubernetes
 <!-- screenshot: ArgoCD UI showing all 12 services synced and healthy -->
 
-### Grafana Dashboards
-<!-- screenshot: Kubernetes cluster dashboard with real metrics -->
+### Phase 4 — Observability
+<!-- screenshot: Grafana cluster dashboard with real metrics -->
+
+### Phase 5 — Security + Load Test
+<!-- screenshot: Trivy scan results and k6 load test -->
 
 ---
 
@@ -177,10 +211,11 @@ kubectl apply -f kubernetes/argocd/
 
 ## What I Learned
 
-*Updated at the end of each phase.*
-
-- **Phase 1:** How Terraform modules work, VPC networking fundamentals, Ansible inventory and playbook structure, k3s vs full EKS tradeoffs
-- More to be added...
+### Phase 1 — In Progress
+- **AWS IAM best practices** — never use root credentials for daily work; always create dedicated IAM users with least-privilege access; manage permissions at the group level so they scale across multiple users
+- **AWS CLI named profiles** — isolate credentials per project using `--profile` flag; prevents accidental resource creation in the wrong account
+- **Terraform remote state** — storing state in S3 instead of locally enables team collaboration and prevents state loss; versioning allows rollback; native S3 locking (Terraform 1.10+) prevents concurrent apply conflicts
+- **Credential security** — `.gitignore` patterns to block secrets from GitHub; the real-world consequences of leaked AWS keys (bots scan GitHub continuously)
 
 ---
 
