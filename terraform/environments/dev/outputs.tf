@@ -5,12 +5,12 @@ output "vpc_id" {
 
 output "jenkins_public_ip" {
   description = "Public IP address of the Jenkins server"
-  value       = module.compute.jenkins_public_ip
+  value       = module.ec2.jenkins_public_ip
 }
 
 output "k3s_public_ip" {
   description = "Public IP address of the k3s Kubernetes node"
-  value       = module.compute.k3s_public_ip
+  value       = module.ec2.k3s_public_ip
 }
 
 output "ecr_repository_urls" {

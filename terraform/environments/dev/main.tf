@@ -23,8 +23,8 @@ module "ecr" {
   environment = var.environment
 }
 
-module "compute" {
-  source = "../../modules/compute"
+module "ec2" {
+  source = "../../modules/ec2"
 
   project               = var.project
   environment           = var.environment
