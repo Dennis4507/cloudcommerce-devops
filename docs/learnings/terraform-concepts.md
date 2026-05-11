@@ -57,7 +57,7 @@ Terraform keeps a record of everything it has created called the state file (`te
 
 Without state, Terraform would try to create everything from scratch every time, even if it already exists.
 
-We store state in S3 (`cloudcommerce-tfstate-927311782753`) instead of locally because:
+We store state in S3 (`cloudcommerce-tfstate-<your-account-id>`) instead of locally because:
 - Local state is lost if your laptop is stolen or dies
 - Team members cannot share local state files
 - S3 versioning allows state rollback if it gets corrupted
@@ -132,7 +132,7 @@ After `terraform apply`, outputs print useful values to the terminal:
 jenkins_public_ip = "18.184.x.x"
 k3s_public_ip     = "3.127.x.x"
 ecr_repository_urls = {
-  frontend    = "927311782753.dkr.ecr.eu-central-1.amazonaws.com/cloudcommerce/frontend"
+  frontend    = "<your-account-id>.dkr.ecr.eu-central-1.amazonaws.com/cloudcommerce/frontend"
   cartservice = "..."
 }
 ```
