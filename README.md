@@ -71,10 +71,11 @@ Developer pushes code to GitHub
   - [x] AWS CLI named profile configured (cloudcommerce → eu-central-1)
   - [x] S3 remote state bucket created (versioning + SSE-S3 encryption enabled)
   - [x] Terraform backend, variables, main, and outputs files created
-  - [ ] VPC module — network foundation
-  - [ ] IAM module — roles and instance profiles
-  - [ ] ECR module — container registries
-  - [ ] Compute module — Jenkins and k3s EC2 instances
+  - [x] VPC module — VPC, subnets, internet gateway, route tables, security groups
+  - [x] IAM module — Jenkins and k3s roles, ECR policies, instance profiles
+  - [x] ECR module — 12 repositories with lifecycle policies and image scanning
+  - [x] EC2 module — Jenkins (t2.micro) and k3s (t3.medium) instances with user data
+  - [ ] Terraform apply — provision all 43 resources in AWS
   - [ ] Ansible — server configuration and k3s install
 - [ ] Phase 2 — CI/CD: Jenkins pipeline + ArgoCD GitOps
 - [ ] Phase 3 — Kubernetes: Helm deploy + Ingress + HPA + RBAC
@@ -103,7 +104,7 @@ cloudcommerce-devops/
 ├── terraform/
 │   ├── modules/
 │   │   ├── vpc/          # VPC, subnets, route tables, internet gateway
-│   │   ├── compute/      # EC2 instances, key pairs, security groups
+│   │   ├── ec2/          # EC2 instances, key pairs, security groups
 │   │   ├── ecr/          # Container registries for all 12 services
 │   │   ├── iam/          # Roles and policies
 │   │   └── dns/          # Route53 hosted zone and records
@@ -129,7 +130,8 @@ cloudcommerce-devops/
 │   ├── bootstrap.sh      # Bring infrastructure up
 │   └── destroy.sh        # Tear down to save costs
 └── docs/
-    └── screenshots/      # Evidence — pipeline runs, dashboards, live app
+    ├── screenshots/      # Evidence — pipeline runs, dashboards, live app
+    └── learnings/        # Deep-dive notes on every concept covered
 ```
 
 ---
@@ -182,7 +184,7 @@ cloudcommerce-devops/
 
 **Prerequisites:**
 - AWS account with programmatic access
-- Terraform >= 1.6
+- Terraform >= 1.10.0
 - Ansible >= 2.15
 - kubectl
 - Helm >= 3.0
@@ -211,11 +213,20 @@ kubectl apply -f kubernetes/argocd/
 
 ## What I Learned
 
-### Phase 1 — In Progress
-- **AWS IAM best practices** — never use root credentials for daily work; always create dedicated IAM users with least-privilege access; manage permissions at the group level so they scale across multiple users
-- **AWS CLI named profiles** — isolate credentials per project using `--profile` flag; prevents accidental resource creation in the wrong account
-- **Terraform remote state** — storing state in S3 instead of locally enables team collaboration and prevents state loss; versioning allows rollback; native S3 locking (Terraform 1.10+) prevents concurrent apply conflicts
-- **Credential security** — `.gitignore` patterns to block secrets from GitHub; the real-world consequences of leaked AWS keys (bots scan GitHub continuously)
+### Phase 1 — Foundation
+
+- **AWS IAM design** — least privilege enforced per service: Jenkins gets ECR push+pull (it builds images), k3s gets ECR pull-only (it only runs them); if k3s is compromised, an attacker cannot push malicious images because the permission does not exist on that server
+- **IAM roles vs access keys** — EC2 instances use IAM roles, not access keys; roles generate temporary credentials automatically that rotate every few hours, so nothing sensitive ever touches the server disk
+- **IAM user groups** — permissions attached to the group, not the individual user; adding a new team member means adding them to the group, not re-configuring every permission
+- **AWS CLI named profiles** — isolate credentials per project using `--profile cloudcommerce`; prevents accidental resource creation in the wrong account when managing multiple AWS projects
+- **Terraform modules vs environments** — modules are reusable blueprints (the HOW: how to build a VPC); environments are deployments (the WHAT and WHERE: dev vs prod); fix a module once and both environments benefit automatically
+- **Terraform remote state** — state stored in S3 with versioning and encryption; versioning allows rollback if state is corrupted; native S3 locking (Terraform 1.10+) prevents two simultaneous `terraform apply` runs from corrupting state
+- **VPC networking layers** — route tables control WHERE traffic goes (subnet level); security groups control WHO is allowed through (instance level); both must say yes for a packet to reach its destination
+- **Public vs private subnets** — only resources that need internet access live in the public subnet (Jenkins for webhooks, k3s for serving traffic); databases will live in the private subnet with no public route, so even if the app is compromised an attacker cannot reach the database directly
+- **ECR lifecycle policies** — automatically delete images older than the last 5 per repository; prevents the registry from accumulating gigabytes of stale images and incurring unnecessary storage costs
+- **Credential security** — `.gitignore` blocks secrets before they can be staged; AWS credentials on a public GitHub repo are found by bots within minutes and used to spin up thousands of EC2 instances for cryptocurrency mining
+
+> Full deep-dive notes for every concept above are in [`docs/learnings/`](docs/learnings/)
 
 ---
 
