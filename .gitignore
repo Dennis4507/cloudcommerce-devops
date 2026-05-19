@@ -23,6 +23,9 @@ secrets.yaml
 *accessKeys*
 *credentials*
 
+# Local runtime info
+server-ips.txt
+
 # OS files
 .DS_Store
 Thumbs.db

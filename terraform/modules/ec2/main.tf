@@ -58,6 +58,15 @@ resource "aws_instance" "jenkins" {
   }
 }
 
+resource "aws_eip" "jenkins" {
+  instance = aws_instance.jenkins.id
+  domain   = "vpc"
+
+  tags = {
+    Name = "${var.project}-${var.environment}-jenkins-eip"
+  }
+}
+
 resource "aws_security_group" "jenkins" {
   name        = "${var.project}-${var.environment}-jenkins-sg"
   description = "Security group for Jenkins server"
@@ -128,6 +137,15 @@ resource "aws_instance" "k3s" {
   tags = {
     Name = "${var.project}-${var.environment}-k3s"
     Role = "k3s"
+  }
+}
+
+resource "aws_eip" "k3s" {
+  instance = aws_instance.k3s.id
+  domain   = "vpc"
+
+  tags = {
+    Name = "${var.project}-${var.environment}-k3s-eip"
   }
 }
 
