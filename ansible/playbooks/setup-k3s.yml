@@ -1,0 +1,32 @@
+---
+- name: Install and configure k3s
+  hosts: k3s
+  become: true
+
+  tasks:
+
+    - name: Download and install k3s with public IP in TLS certificate
+      shell: curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--tls-san 63.184.235.88" sh -
+
+    - name: Wait for k3s API server to be available
+      wait_for:
+        port: 6443
+        delay: 10
+        timeout: 120
+
+    - name: Wait for node to reach Ready state
+      shell: k3s kubectl get node | grep -v NotReady | grep Ready
+      register: node_ready
+      until: node_ready.rc == 0
+      retries: 12
+      delay: 10
+      changed_when: false
+
+    - name: Get kubeconfig
+      command: cat /etc/rancher/k3s/k3s.yaml
+      register: kubeconfig
+      changed_when: false
+
+    - name: Print kubeconfig for local setup
+      debug:
+        msg: "{{ kubeconfig.stdout }}"

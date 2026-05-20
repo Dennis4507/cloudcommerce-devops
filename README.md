@@ -662,14 +662,261 @@ An admin account was created and Jenkins is now fully operational.
 
 ---
 
-## Phase 3 — Kubernetes *(upcoming)*
+## Phase 3 — Kubernetes
 
-- [ ] Install k3s via Ansible
-- [ ] Configure kubectl on local machine
+### Why k3s
+
+k3s is a CNCF-certified Kubernetes distribution built for resource-constrained environments. On an EC2 t3.medium with 20GB storage, full upstream Kubernetes would consume most available memory before any workloads run. k3s ships as a single binary (~100MB), uses less than 512MB RAM at idle, and includes everything needed for a production-grade cluster: containerd, CoreDNS, Traefik ingress, and persistent volume support. It is fully Kubernetes-compatible — every `kubectl` command, every Helm chart, every manifest written for upstream Kubernetes works identically on k3s.
+
+The t3.medium running k3s has 2 vCPUs and 4GB RAM — sufficient for the 12-microservice Online Boutique application plus Prometheus, Grafana, and ArgoCD.
+
+---
+
+### Pre-flight Checks — Verifying the Server Before Installation
+
+Before running the k3s playbook, Ansible connectivity to the k3s server was verified using the same `ansible ping` command used in Phase 2. The k3s server was also inspected to confirm Docker was running, disk had sufficient space, and memory was adequate.
+
+![k3s Ansible Ping Success](docs/screenshots/30-k3s-ansible-ping-success.png)
+*Ansible ping to k3s server (63.184.235.88) succeeds — SSH connectivity confirmed before playbook run*
+
+![k3s Server Resources Verified](docs/screenshots/31-k3s-docker-verified.png)
+*Docker running, disk and RAM verified on the k3s EC2 instance — server ready for k3s installation*
+
+---
+
+### Installing k3s via Ansible
+
+k3s is not available via apt. It is installed by piping a shell script from the official k3s distribution server directly into the shell — a single curl command that downloads and installs the binary, configures systemd, and starts the service in one step.
+
+The Ansible playbook automates this:
+
+```yaml
+- name: Download and install k3s
+  shell: curl -sfL https://get.k3s.io | sh -
+
+- name: Wait for k3s API server to be available
+  wait_for:
+    port: 6443
+    delay: 10
+    timeout: 120
+
+- name: Wait for node to reach Ready state
+  shell: k3s kubectl get node | grep -v NotReady | grep Ready
+  register: node_ready
+  until: node_ready.rc == 0
+  retries: 12
+  delay: 10
+  changed_when: false
+```
+
+The `wait_for` task pauses until port 6443 (the Kubernetes API server) is accepting connections. The follow-up task polls until the node reaches Ready state — k3s starts the API server before the node is fully initialised, so both checks are necessary.
+
+![k3s First Install Success](docs/screenshots/32-k3s-install-success.png)
+*k3s playbook first run — all tasks ok, cluster installed and node reached Ready state*
+
+---
+
+### Setting Up kubectl — Local Cluster Access
+
+kubectl is the Kubernetes CLI — it runs locally, connects to the cluster API over HTTPS on port 6443, and sends commands to the cluster. To connect kubectl to the k3s cluster, the cluster's credentials file (kubeconfig) must be copied from the server to the local machine.
+
+#### kubectl Installation — Four Failures Before Success
+
+Getting kubectl onto Windows turned into a multi-step debugging exercise that required working around several issues in sequence.
+
+**Attempt 1 — winget**
+
+The first approach was the Windows package manager:
+
+```powershell
+winget install -e --id Kubernetes.kubectl
+```
+
+Winget reported success ("Erfolgreich installiert"). But `kubectl` could not be found anywhere on the system — `Get-Command kubectl` returned nothing, `where.exe kubectl` returned nothing. The installation completed without error but placed the binary somewhere outside the PATH with no indication of where.
+
+![winget kubectl install](docs/screenshots/32a-winget-kubectl-install.png)
+*winget reports success — but kubectl is not findable on the PATH after installation*
+
+![kubectl not found](docs/screenshots/32b-kubectl-not-found.png)
+*Get-Command kubectl and where.exe kubectl both return nothing — winget installed somewhere inaccessible*
+
+**Attempt 2 — PowerShell Invoke-WebRequest to System32**
+
+```powershell
+Invoke-WebRequest -Uri "https://dl.k8s.io/release/v1.36.1/bin/windows/amd64/kubectl.exe" `
+  -OutFile "C:\Windows\System32\kubectl.exe"
+```
+
+Access denied — writing to System32 requires elevated permissions that were not available in the current terminal session.
+
+![kubectl reinstall attempt](docs/screenshots/32c-kubectl-reinstall-attempt.png)
+*PowerShell Invoke-WebRequest to System32 — access denied, insufficient permissions*
+
+**Attempt 3 — PowerShell Invoke-WebRequest to Project Directory**
+
+```powershell
+Invoke-WebRequest -Uri "https://dl.k8s.io/release/v1.36.1/bin/windows/amd64/kubectl.exe" `
+  -OutFile "C:\Users\OnlyM\Devops Project\kubectl.exe"
+```
+
+The download started but the connection broke mid-transfer. Network interruption, no partial file recovered.
+
+![kubectl download failed](docs/screenshots/32d-kubectl-download-failed.png)
+*PowerShell download failed with connection error — no binary recovered*
+
+**Resolution — WSL curl**
+
+PowerShell's Invoke-WebRequest has known TLS and connection handling issues. WSL curl is more reliable for large binary downloads. From inside WSL:
+
+```bash
+curl -LO "https://dl.k8s.io/release/v1.36.1/bin/windows/amd64/kubectl.exe"
+```
+
+This downloaded the binary successfully into the current WSL directory, which is accessible from Windows at `C:\Users\OnlyM\Devops Project\`.
+
+![kubeconfig first copy and kubectl download](docs/screenshots/32e-kubeconfig-first-copy-and-kubectl-download.png)
+*kubeconfig copied from the server and kubectl.exe downloaded via WSL curl — binary available in the project directory*
+
+---
+
+### Challenge: TLS Certificate Error — Public IP Not in the Certificate
+
+With kubectl available, the kubeconfig was copied from the k3s server and updated to point at the public Elastic IP:
+
+```yaml
+server: https://63.184.235.88:6443
+```
+
+Running `kubectl get nodes` produced a TLS certificate error:
+
+```
+tls: failed to verify certificate: x509: certificate is valid for
+10.0.1.135, 10.43.0.1, 127.0.0.1, ::1, not 63.184.235.88
+```
+
+![kubectl TLS cert error](docs/screenshots/32f-kubectl-tls-cert-error.png)
+*kubectl get nodes fails — k3s self-signed certificate does not include the public Elastic IP*
+
+**Root cause:** k3s generates a self-signed TLS certificate during installation and includes a list of IPs the certificate is valid for (Subject Alternative Names). By default, it only includes the node's private IP (`10.0.1.135`), the cluster service IP (`10.43.0.1`), and loopback addresses. The public Elastic IP (`63.184.235.88`) is not in the certificate — so TLS verification fails when connecting from outside the VPC.
+
+This is a design constraint of how TLS works: a certificate must explicitly list every IP or hostname it is valid for. The certificate is generated at install time, so there is no way to add the public IP after the fact without reinstalling.
+
+**Fix:** The k3s install command accepts an `INSTALL_K3S_EXEC` environment variable that passes flags to the k3s server. The `--tls-san` flag adds entries to the TLS certificate's Subject Alternative Names list:
+
+```bash
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--tls-san 63.184.235.88" sh -
+```
+
+The Ansible playbook was updated:
+
+![Playbook TLS SAN Fix](docs/screenshots/32g-playbook-tls-san-fix.png)
+*setup-k3s.yml updated — INSTALL_K3S_EXEC="--tls-san 63.184.235.88" added to include the Elastic IP in the TLS certificate*
+
+The `args.creates` guard that prevented re-running the install task was removed — k3s was already installed, but its certificate needed to be regenerated with the correct SANs.
+
+#### k3s Reinstall
+
+The updated playbook was run, triggering a clean reinstall of k3s with the correct TLS configuration:
+
+![k3s reinstall command](docs/screenshots/32h-k3s-reinstall-command.png)
+*Ansible playbook command with updated inventory and credentials — targeting the k3s reinstall*
+
+![k3s reinstall running](docs/screenshots/32i-k3s-reinstall-running.png)
+*k3s reinstalling — tasks running, node returning to Ready state with new TLS certificate*
+
+---
+
+### k3s Reinstall Success — TLS SAN Fixed
+
+The second playbook run completed successfully with the updated certificate:
+
+![k3s Second Install Success](docs/screenshots/33-k3s-install-success.png)
+*k3s reinstall — all tasks complete, node Ready, new certificate includes 63.184.235.88 in SANs*
+
+The kubeconfig was re-copied from the server (the first copy contained the old certificate's cluster authority data):
+
+![kubeconfig copy](docs/screenshots/33a-kubeconfig-copy.png)
+*Copying fresh kubeconfig from the server after reinstall — the cluster CA data has changed*
+
+![kubeconfig copy result](docs/screenshots/33b-kubeconfig-copy-result.png)
+*kubeconfig content — server set to https://63.184.235.88:6443, certificate-authority-data updated*
+
+With the fresh kubeconfig in place, `kubectl get nodes` succeeded:
+
+![kubectl get nodes success](docs/screenshots/33c-kubectl-get-nodes-success.png)
+*kubectl get nodes — node ip-10-0-1-135 status Ready, control-plane role confirmed. Remote kubectl access to the cluster is working.*
+
+**What this teaches:** k3s (and Kubernetes in general) generates TLS certificates at cluster initialisation time. For remote access from outside the cluster's internal network, the public-facing IP must be declared via `--tls-san` *before* installation — not added after. Discovering this through the x509 error is common; the fix is a full reinstall with the correct flag, which Ansible makes trivial to reproduce.
+
+---
+
+### Installing k9s — Terminal UI for Cluster Management
+
+kubectl is the authoritative tool for Kubernetes operations. k9s is a terminal UI built on top of kubectl that makes it faster to navigate pods, view logs, and inspect cluster state without remembering the full kubectl syntax for every operation.
+
+k9s was installed in WSL using the official installer script:
+
+```bash
+curl -sS https://webinstall.dev/k9s | bash
+```
+
+![k9s web install](docs/screenshots/33d-k9s-webinstall.png)
+*k9s v0.50.18 installed via webinstall in WSL — binary placed in ~/.local/bin*
+
+k9s was launched directly to the pods view to avoid navigating from the default start screen:
+
+```bash
+k9s --command pods
+```
+
+![k9s terminal launch](docs/screenshots/33e-k9s-terminal-launch.png)
+*k9s launching — kubeconfig detected, connecting to k3s cluster at 63.184.235.88:6443*
+
+All 7 system pods were Running with healthy resource usage — 3% CPU, 28% memory on the t3.medium node:
+
+![k9s dashboard](docs/screenshots/34-k9s-dashboard.png)
+*k9s pods view — 7 system pods all Running: coredns, metrics-server, traefik, local-path-provisioner, svclb-traefik. Cluster health confirmed.*
+
+For comparison, the same cluster state from kubectl:
+
+```bash
+kubectl get pods -A
+```
+
+![kubectl all pods](docs/screenshots/35-kubectl-all-pods.png)
+*kubectl get pods -A — all namespaces, all pods Running. k9s and kubectl showing identical cluster state.*
+
+---
+
+### Making kubectl PATH Permanent on Windows
+
+The temporary PATH addition (`$env:PATH += "..."`) does not persist across PowerShell sessions. The permanent fix uses the Windows environment registry directly via SetEnvironmentVariable:
+
+```powershell
+[System.Environment]::SetEnvironmentVariable(
+    "PATH",
+    $env:PATH + ";C:\Users\OnlyM\Devops Project",
+    [System.EnvironmentVariableTarget]::User
+)
+```
+
+New terminal sessions inherit the updated PATH automatically — no manual setup required.
+
+![kubectl permanent path](docs/screenshots/36-kubectl-permanent-path.png)
+*kubectl get nodes working in a new PowerShell session — PATH is permanent, no manual setup needed*
+
+---
+
+### Progress
+- [x] k3s installed via Ansible — single-binary Kubernetes on EC2 t3.medium
+- [x] TLS SAN challenge diagnosed and resolved — public Elastic IP added to certificate via `--tls-san`
+- [x] kubectl installed and configured — remote cluster access from local machine confirmed
+- [x] k9s v0.50.18 installed — terminal UI showing all 7 system pods Running
+- [x] kubectl PATH made permanent on Windows — works across all terminal sessions
+- [ ] Install ArgoCD on k3s cluster
 - [ ] Deploy Online Boutique via Helm
 - [ ] Configure Ingress
 - [ ] Set up HPA (Horizontal Pod Autoscaler)
-- [ ] Configure RBAC
 
 ---
 
