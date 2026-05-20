@@ -1,0 +1,68 @@
+---
+- name: Install and configure Jenkins
+  hosts: jenkins
+  become: true
+
+  tasks:
+
+    - name: Install Java 17 and dependencies
+      apt:
+        name:
+          - openjdk-17-jdk
+          - curl
+          - gnupg
+        state: present
+        update_cache: yes
+
+    - name: Import Jenkins GPG key from keyserver
+      shell: |
+        gpg --no-default-keyring \
+            --keyring /usr/share/keyrings/jenkins-keyring.gpg \
+            --keyserver keyserver.ubuntu.com \
+            --recv-keys 7198F4B714ABFC68
+        chmod 644 /usr/share/keyrings/jenkins-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/jenkins-keyring.gpg
+
+    - name: Add Jenkins apt repository
+      shell: |
+        echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.gpg] https://pkg.jenkins.io/debian-stable binary/" \
+          > /etc/apt/sources.list.d/jenkins.list
+      args:
+        creates: /etc/apt/sources.list.d/jenkins.list
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install Jenkins
+      apt:
+        name: jenkins
+        state: present
+
+    - name: Start and enable Jenkins
+      systemd:
+        name: jenkins
+        state: started
+        enabled: yes
+
+    - name: Add jenkins user to docker group
+      user:
+        name: jenkins
+        groups: docker
+        append: yes
+
+    - name: Wait for Jenkins to start
+      wait_for:
+        port: 8080
+        delay: 10
+        timeout: 120
+
+    - name: Get Jenkins initial admin password
+      command: cat /var/lib/jenkins/secrets/initialAdminPassword
+      register: jenkins_password
+      changed_when: false
+
+    - name: Print Jenkins initial admin password
+      debug:
+        msg: "Jenkins initial admin password: {{ jenkins_password.stdout }}"

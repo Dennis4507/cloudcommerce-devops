@@ -411,7 +411,164 @@ This was tested: both instances were stopped overnight and restarted the followi
 
 ## Phase 2 — CI/CD Pipeline *(in progress)*
 
-- [ ] Install Jenkins via Ansible
+### Ansible Setup — Configuring Servers Without Touching Them
+
+Ansible is the configuration management layer. Where Terraform provisions infrastructure (what exists in AWS), Ansible configures what runs on those servers — installing packages, writing config files, starting services, managing users. It is agentless: there is nothing to install on the target servers. Ansible SSHes in from the control node, runs tasks, and disconnects. Every task is idempotent — running the same playbook twice produces the same result without duplicating work.
+
+The control node for this project is WSL (Windows Subsystem for Linux) on the local machine, running Ubuntu 22.04. Ansible does not run natively on Windows, so WSL provides the Linux environment required.
+
+#### Step 1 — Install Ansible on WSL
+
+Ansible was installed via pip rather than Ubuntu's packaged version. The Ubuntu package is typically several versions behind; pip gives the current release.
+
+![WSL Ubuntu Start](docs/screenshots/20a-wsl-ubuntu-start.png)
+*WSL Ubuntu 22.04 — the Ansible control node for this project*
+
+![Ansible Install](docs/screenshots/20b-ansible-install.png)
+*Ansible installed via pip — current release, not Ubuntu's older packaged version*
+
+![Ansible Version](docs/screenshots/20c-ansible-version.png)
+*ansible --version confirms installation and the Python interpreter being used*
+
+#### Step 2 — SSH Key Setup
+
+The SSH private key lives in `terraform/keys/` on the Windows filesystem. For Ansible to use it from WSL, it must be copied into the WSL home directory with restrictive permissions. SSH (and by extension Ansible) refuses to use private keys that are readable by other users — this is a hard security requirement, not a warning.
+
+```bash
+cp /mnt/c/Users/OnlyM/Devops\ Project/cloudcommerce-devops/terraform/keys/cloudcommerce-dev-key ~/.ssh/
+chmod 600 ~/.ssh/cloudcommerce-dev-key
+```
+
+![SSH Key Setup](docs/screenshots/21-wsl-ansible-ssh-key-setup.png)
+*Private key copied to WSL home directory with chmod 600 — SSH security requirement enforced*
+
+---
+
+#### Challenge: Ansible Refused to Load Config from the Windows Filesystem
+
+The first ping attempt produced no hosts at all — not a connection failure, but Ansible silently ignoring its own configuration:
+
+```
+[WARNING]: Ansible is being run in a world writable directory, ignoring it as an ansible.cfg source.
+[WARNING]: provided hosts list is empty, only localhost is available.
+```
+
+![Ansible World-Writable Warning](docs/screenshots/22-ansible-wsl-worldwritable-warning.png)
+*Ansible ignores ansible.cfg from /mnt/c/ — world-writable filesystem is treated as untrusted*
+
+**Root cause:** The Windows filesystem mounted in WSL at `/mnt/c/` has world-writable permissions by default. Ansible has a deliberate security rule that refuses to auto-load `ansible.cfg` from world-writable directories — on a shared system, a malicious `ansible.cfg` in a world-writable directory could inject configuration without the user knowing. Without the config file, Ansible found no inventory and no hosts.
+
+**Solution:** Pass inventory and credentials explicitly on every command instead of relying on auto-loading:
+
+```bash
+ansible all -i inventory/hosts -m ping --private-key ~/.ssh/cloudcommerce-dev-key -u ubuntu
+```
+
+**What this teaches:** Understanding *why* a tool rejects configuration — not just that it does — is the difference between a real fix and a blind workaround. The restriction exists for a genuine security reason. The correct response is to work with it, not disable it.
+
+---
+
+Both servers responded immediately once the explicit flags were passed:
+
+![Ansible Ping Success](docs/screenshots/23-ansible-ping-success.png)
+*Both servers respond with pong — Ansible SSH connectivity to Jenkins (3.127.90.169) and k3s (63.184.235.88) confirmed*
+
+---
+
+### Writing the Jenkins Playbook
+
+With connectivity proven, the first playbook was written to install Jenkins. A single YAML file automates the complete setup: Java 17 (Jenkins runtime dependency), GPG key import, apt repository configuration, Jenkins installation and service management, Docker group membership for the jenkins user, and initial admin password retrieval.
+
+![Jenkins Playbook](docs/screenshots/24-jenkins-playbook.png)
+*setup-jenkins.yml in VS Code — all tasks in sequence, from Java install to password retrieval*
+
+---
+
+### Challenge: Jenkins GPG Key — Two Separate Problems
+
+Installing Jenkins exposed two distinct GPG key problems encountered in sequence. Each required a different diagnosis technique.
+
+#### Problem 1 — Key Format: `.asc` vs `.gpg`
+
+The initial playbook used `get_url` to download Jenkins' GPG key as an ASCII-armored `.asc` file. Apt's `signed-by` mechanism requires keys in binary (dearmored) format. The mismatch caused every `apt-get update` to reject the repository as unsigned:
+
+```
+NO_PUBKEY 7198F4B714ABFC68
+E: The repository 'https://pkg.jenkins.io/debian-stable binary/ Release' is not signed.
+```
+
+![Ansible Jenkins Run Failed](docs/screenshots/25-ansible-jenkins-run-failed.png)
+*First playbook run — FAILED at apt update, repository signature verification rejected*
+
+![Ansible Jenkins Run Failed 2](docs/screenshots/25b-ansible-jenkins-run-failed2.png)
+*Second run — same error after first attempted fix*
+
+**Fix:** Pipe the downloaded key through `gpg --dearmor` to convert it from ASCII to binary format. The `apt_repository` Ansible module was also replaced with a `shell` task — the module auto-triggers a cache update internally before the key is fully in place, creating a race condition.
+
+```bash
+curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key | gpg --dearmor -o /usr/share/keyrings/jenkins-keyring.gpg
+```
+
+![Ansible Jenkins Run Failed 3](docs/screenshots/25c-ansible-jenkins-run-failed3.png)
+*Third run after dearmor fix — same error. The problem was not the format.*
+
+---
+
+#### Problem 2 — Expired Key at the Official URL
+
+The same error after the dearmor fix indicated the key content was wrong, not just the format. The next step was SSH directly into the Jenkins server and inspect the actual key that was downloaded:
+
+```bash
+gpg --show-keys /usr/share/keyrings/jenkins-keyring.gpg
+```
+
+Output:
+
+```
+pub   rsa4096 2023-03-27 [SC] [expired: 2026-03-26]
+      63667EE74BBA1F0A08A698725BA31D57EF5975CA
+```
+
+![Jenkins Wrong Key](docs/screenshots/26b-jenkins-wrong-key.png)
+*gpg --show-keys reveals the key downloaded from jenkins.io-2023.key URL — fingerprint 5BA31D57EF5975CA, expired March 2026*
+
+The key at `jenkins.io-2023.key` **expired in March 2026**. Its fingerprint (`5BA31D57EF5975CA`) does not match the key Jenkins is actually using to sign the repository (`7198F4B714ABFC68`). Jenkins rotated their signing key but the old URL continues to serve the expired key — a silent trap for anyone following documentation written before the rotation.
+
+![Ansible Jenkins Run Failed 4](docs/screenshots/25d-ansible-jenkins-run-failed4.png)
+*Fourth run — dearmor correct, but expired key from URL causes the same signature failure*
+
+![Ansible Jenkins Run Failed 5](docs/screenshots/25e-ansible-jenkins-run-failed5.png)
+*Fifth run — all automated retries failed before manual server inspection identified the root cause*
+
+![Jenkins Repo First Attempt](docs/screenshots/26a-jenkins-repo-first-attempt.png)
+*Manual commands on the server — isolating whether the issue was the playbook or the key itself*
+
+---
+
+#### Resolution — Fetch the Current Key by ID from a Keyserver
+
+Rather than downloading from a URL that serves whatever key the Jenkins team last published there, fetch the specific key by its ID from a dedicated key distribution server:
+
+```bash
+sudo gpg --no-default-keyring \
+    --keyring /usr/share/keyrings/jenkins-keyring.gpg \
+    --keyserver keyserver.ubuntu.com \
+    --recv-keys 7198F4B714ABFC68
+```
+
+A keyserver lookup by ID always returns the current valid key for that ID. The playbook was rewritten with this approach, and `apt-get update` was run manually on the server first to confirm the fix before finalising the playbook.
+
+![Jenkins Repo Verified Success](docs/screenshots/27-jenkins-repo-verified-success.png)
+*apt-get update succeeds — Jenkins repository trusted, packages now available for installation*
+
+**What this teaches:** Package signing keys expire and rotate. Hardcoding a key URL in automation is fragile — the URL may serve a stale or expired key indefinitely after rotation. Fetching by key ID from a keyserver always retrieves the current valid key. Manual server debugging (SSH in, run the failing command by hand, inspect the artefacts) is often the fastest path to the actual root cause when automated retries produce the same error.
+
+---
+
+### Progress
+- [x] Ansible connectivity verified — both servers reachable (ping: pong)
+- [x] Jenkins GPG key issue diagnosed and resolved — keyserver approach adopted in final playbook
+- [ ] Install Jenkins via Ansible (playbook ready — run pending)
 - [ ] Configure Jenkins (plugins, credentials, pipeline)
 - [ ] Write Jenkinsfile — build, scan with Trivy, push to ECR
 - [ ] Configure GitHub webhook → Jenkins trigger
