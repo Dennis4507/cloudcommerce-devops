@@ -1125,6 +1125,149 @@ Key fields:
 
 ---
 
+### Applying the ArgoCD Application — First Sync
+
+With the Helm chart committed and pushed to GitHub, the ArgoCD Application manifest was applied:
+
+```bash
+kubectl apply -f kubernetes/argocd/online-boutique.yaml
+```
+
+![kubectl apply ArgoCD app](docs/screenshots/45-kubectl-apply-argocd-app.png)
+*kubectl apply — Application resource created in ArgoCD*
+
+ArgoCD detected the new Application immediately and began syncing — pulling the Helm chart from our GitHub repo, rendering all 12 service templates with our values.yaml, and applying them to the `online-boutique` namespace:
+
+![ArgoCD syncing](docs/screenshots/46-argocd-syncing.png)
+*ArgoCD showing online-boutique app syncing — Progressing/Synced, pulling from Dennis4507/cloudcommerce-devops*
+
+![ArgoCD tree view](docs/screenshots/47-argocd-tree-view.png)
+*ArgoCD application tree — all 12 deployments, services, and service accounts visible*
+
+![ArgoCD tree view 2](docs/screenshots/47a-argocd-tree-view2.png)
+*ArgoCD tree view detail — each deployment with its ReplicaSet and running pod*
+
+---
+
+### Challenge: 404 — Traefik vs LoadBalancer
+
+With all pods running, opening `http://63.184.235.88` returned a 404. The issue: the Helm chart creates a `frontend-external` LoadBalancer service for cloud environments where a load balancer is provisioned automatically. On k3s, Traefik already owns port 80 — the LoadBalancer service stayed in `<pending>` indefinitely and ArgoCD reported "Progressing" instead of "Healthy".
+
+```bash
+kubectl get svc -n online-boutique
+```
+
+![kubectl get svc](docs/screenshots/48-kubectl-get-svc.png)
+*frontend-external showing EXTERNAL-IP: pending — LoadBalancer cannot get an IP, Traefik owns port 80*
+
+![404 page](docs/screenshots/49-frontend-404.png)
+*http://63.184.235.88 returns 404 — Traefik has no route to the frontend yet*
+
+**Fix — Traefik Ingress:** k3s ships with Traefik as the ingress controller. Instead of a LoadBalancer service, an Ingress resource routes HTTP traffic through Traefik to the frontend pod. A new template was added to the Helm chart:
+
+```yaml
+# kubernetes/apps/online-boutique/templates/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: online-boutique
+  namespace: {{ .Release.Namespace }}
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend
+            port:
+              number: 80
+```
+
+![Ingress yaml](docs/screenshots/50-ingress-yaml.png)
+*ingress.yaml added to templates/ — routes all port 80 traffic through Traefik to the frontend service*
+
+The chart was validated before committing:
+
+![helm lint ingress](docs/screenshots/51-helm-lint-ingress.png)
+*helm lint — 0 failures after adding ingress.yaml*
+
+The `frontend.externalService` value was also set to `false` in `values.yaml` to remove the pending LoadBalancer service and clear the ArgoCD "Progressing" health status:
+
+![externalService false](docs/screenshots/52-externalservice-false.png)
+*values.yaml — externalService: false removes the frontend-external LoadBalancer service*
+
+ArgoCD detected both commits and synced automatically. All 12 pods confirmed running:
+
+![kubectl pods running](docs/screenshots/53-kubectl-pods-running.png)
+*kubectl get pods -n online-boutique — all 12 pods Running 1/1*
+
+![ArgoCD healthy](docs/screenshots/54-argocd-healthy.png)
+*ArgoCD showing APP HEALTH: Healthy, SYNC STATUS: Synced — all resources reconciled*
+
+---
+
+### Online Boutique — Live
+
+With Traefik routing traffic correctly, `http://63.184.235.88` loaded the full e-commerce application:
+
+![Online Boutique live](docs/screenshots/55-online-boutique-live.png)
+*Online Boutique homepage — 12 microservices serving a live e-commerce storefront on k3s*
+
+![Online Boutique products](docs/screenshots/55a-online-boutique-products.png)
+*Product catalogue — sunglasses, clothing, watches served by the productcatalogservice microservice*
+
+![Online Boutique cart](docs/screenshots/55b-online-boutique-cart.png)
+*Shopping cart — cartservice handling session state via Redis*
+
+![Order complete](docs/screenshots/56-order-complete.png)
+*Order confirmed — all 12 microservices working end to end: frontend → checkout → payment → email*
+
+The full GitOps pipeline is proven: a git commit to the infrastructure repo triggered ArgoCD to deploy a live, functional 12-microservice application accessible from the public internet.
+
+---
+
+### Jenkins Credentials — Securing Pipeline Secrets
+
+With the application running, Jenkins was configured to build and push images to ECR. All sensitive values are stored in Jenkins' built-in credentials store — never in Jenkinsfiles or logs.
+
+Two credentials were added:
+
+**1 — GitHub Personal Access Token** — allows Jenkins to commit the updated `values.yaml` back to GitHub after each build:
+
+![GitHub token creation](docs/screenshots/57-github-token-creation.png)
+*GitHub classic personal access token — repo scope only, named Jenkins CloudCommerce*
+
+![Jenkins credentials form](docs/screenshots/58-jenkins-credentials-form.png)
+*Jenkins credentials form — token added as Username with password type*
+
+**2 — AWS Account ID** — used to construct the ECR registry URL in the pipeline:
+
+![Jenkins credentials complete](docs/screenshots/59-jenkins-credentials-complete.png)
+*Jenkins Globale Zugangsdaten — both credentials in place: github-token and aws-account-id*
+
+Jenkins uses the EC2 instance's IAM role for ECR authentication — no AWS access keys stored anywhere. The IAM role was provisioned by Terraform in Phase 1 with the exact permissions needed.
+
+---
+
+### Application Repository — microservices-demo
+
+The Jenkinsfile belongs in the application repository, not the infrastructure repository. A separate GitHub repo was created for the application source:
+
+**`Dennis4507/microservices-demo`** — the application code Jenkins builds from
+
+This separates concerns correctly:
+- `Dennis4507/cloudcommerce-devops` — infrastructure, Helm charts, Ansible, Terraform (DevOps team)
+- `Dennis4507/microservices-demo` — application source code (development team)
+
+Google's CI workflows (`.github/workflows/`) were removed — Jenkins replaces them:
+
+![microservices-demo push](docs/screenshots/60-microservices-demo-push.png)
+*Google's GitHub Actions workflows removed, microservices-demo pushed to Dennis4507's GitHub — Jenkins owns CI from here*
+
+---
+
 ### Progress
 - [x] k3s installed via Ansible — single-binary Kubernetes on EC2 t3.medium
 - [x] TLS SAN challenge diagnosed and resolved — public Elastic IP added to certificate via `--tls-san`
@@ -1134,11 +1277,15 @@ Key fields:
 - [x] ArgoCD installed via Ansible — two kubectl apply challenges diagnosed and resolved
 - [x] ArgoCD UI accessible at https://63.184.235.88:30080 — GitOps engine live
 - [x] Online Boutique Helm chart copied into repo — chart validated with helm lint
-- [x] ArgoCD Application manifest created — points at our repo, not Google's
-- [ ] Apply Application manifest — ArgoCD syncs and deploys all 12 services
-- [ ] Online Boutique accessible in browser
-- [ ] Configure Ingress
-- [ ] Set up HPA (Horizontal Pod Autoscaler)
+- [x] ArgoCD Application manifest created and applied — all 12 services deployed
+- [x] Traefik Ingress configured — 404 resolved, site live at http://63.184.235.88
+- [x] Online Boutique fully functional — products, cart, and checkout all working
+- [x] Jenkins credentials configured — GitHub token and AWS account ID secured
+- [x] Application repo created — Dennis4507/microservices-demo owns the application source
+- [ ] Install Trivy and AWS CLI on Jenkins server via Ansible
+- [ ] Create Jenkins pipeline job pointing at microservices-demo
+- [ ] Configure GitHub webhook → Jenkins trigger
+- [ ] Run first full pipeline build → ECR → values.yaml update → ArgoCD deploy
 
 ---
 

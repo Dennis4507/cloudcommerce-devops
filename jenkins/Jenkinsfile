@@ -1,0 +1,93 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION = 'eu-central-1'
+        SERVICE    = 'frontend'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Clone Application Source') {
+            steps {
+                sh 'git clone --depth 1 https://github.com/GoogleCloudPlatform/microservices-demo.git app-source'
+            }
+        }
+
+        stage('Build Image') {
+            steps {
+                withCredentials([string(credentialsId: 'aws-account-id', variable: 'AWS_ACCOUNT_ID')]) {
+                    script {
+                        env.IMAGE_TAG = sh(
+                            script: 'git -C app-source rev-parse --short HEAD',
+                            returnStdout: true
+                        ).trim()
+                        env.ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+                        env.ECR_IMAGE    = "${env.ECR_REGISTRY}/cloudcommerce/${SERVICE}:${env.IMAGE_TAG}"
+                    }
+                    sh '''
+                        aws ecr get-login-password --region ${AWS_REGION} \
+                            | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                        docker build -t ${ECR_IMAGE} app-source/src/${SERVICE}/
+                    '''
+                }
+            }
+        }
+
+        stage('Scan with Trivy') {
+            steps {
+                sh '''
+                    trivy image \
+                        --exit-code 0 \
+                        --severity HIGH,CRITICAL \
+                        --no-progress \
+                        ${ECR_IMAGE}
+                '''
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                sh 'docker push ${ECR_IMAGE}'
+            }
+        }
+
+        stage('Update values.yaml') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'aws-account-id', variable: 'AWS_ACCOUNT_ID'),
+                    usernamePassword(credentialsId: 'github-token', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')
+                ]) {
+                    sh '''
+                        git config user.email "jenkins@cloudcommerce.dev"
+                        git config user.name "Jenkins"
+
+                        NEW_REPO="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/cloudcommerce"
+
+                        sed -i "s|  repository:.*|  repository: ${NEW_REPO}|" kubernetes/apps/online-boutique/values.yaml
+                        sed -i "s|  tag:.*|  tag: \\"${IMAGE_TAG}\\"|" kubernetes/apps/online-boutique/values.yaml
+
+                        git add kubernetes/apps/online-boutique/values.yaml
+                        git commit -m "ci: update frontend image to ${IMAGE_TAG} [skip ci]"
+                        git push https://${GIT_USER}:${GIT_TOKEN}@github.com/Dennis4507/cloudcommerce-devops.git HEAD:main
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh '''
+                docker rmi ${ECR_IMAGE} || true
+                rm -rf app-source
+            '''
+        }
+    }
+}
