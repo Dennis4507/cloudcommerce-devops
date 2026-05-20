@@ -1004,6 +1004,127 @@ Opening `https://63.184.235.88:30080` shows the expected TLS warning — the sam
 
 ---
 
+### Deploying Online Boutique — Helm and GitOps
+
+With ArgoCD running, the next step is deploying the application. This required two decisions: how to package the application for Kubernetes, and where that package should live.
+
+#### What is Helm?
+
+Helm is the package manager for Kubernetes. Raw Kubernetes manifests are static — every value is hardcoded. Helm introduces templates with variables:
+
+```yaml
+# Raw manifest — hardcoded, cannot change without editing the file
+image: us-central1-docker.pkg.dev/google-samples/frontend:v0.10.1
+
+# Helm template — variable, controlled by values.yaml
+image: {{ .Values.images.repository }}/frontend:{{ .Values.images.tag }}
+```
+
+A single `values.yaml` controls the entire deployment:
+
+```yaml
+images:
+  repository: 123456789.dkr.ecr.eu-central-1.amazonaws.com/cloudcommerce
+  tag: "abc123f"   ← Jenkins writes this after every build
+```
+
+One chart, one `values.yaml` — different values for different environments. `values.yaml` is also the handoff point between Jenkins (CI) and ArgoCD (CD): Jenkins builds an image, pushes it to ECR, writes the new tag into `values.yaml`, commits to GitHub. ArgoCD detects the commit and deploys.
+
+#### Why the Helm Chart Lives in Our Repo
+
+The first instinct was to point ArgoCD at Google's public microservices-demo repository and use their Helm chart directly. This is a shortcut that removes a critical step:
+
+- Google's chart uses Google's image registry — not our ECR
+- Google could change their chart without warning and break the deployment
+- `values.yaml` must be in our repo — it's where Jenkins writes the new image tag
+- The chart is infrastructure code — it belongs under version control in our project alongside the Ansible playbooks and Terraform modules
+
+The correct approach: copy the Helm chart into our repo and own it.
+
+```
+kubernetes/
+└── apps/
+    └── online-boutique/
+        ├── Chart.yaml      ← chart name, version, metadata
+        ├── values.yaml     ← our config — image registry, replicas, resources
+        └── templates/      ← all 12 service definitions as Helm templates
+```
+
+![Helm chart structure](docs/screenshots/42-helm-chart-structure.png)
+*Online Boutique Helm chart in our repo — Chart.yaml, values.yaml, and templates/ all under version control*
+
+![values.yaml](docs/screenshots/44-values-yaml-open.png)
+*values.yaml — images.repository points to Google's registry now, will be updated to ECR once Jenkins is building images. The tag field is what Jenkins writes after every build.*
+
+#### Validating the Chart with helm lint
+
+Helm v3 was already installed in WSL — confirmed before running any chart commands:
+
+![helm version](docs/screenshots/42a-helm-version.png)
+*helm v3.17.3 confirmed in WSL — ready to lint and template charts locally*
+
+Before committing, the chart was validated locally:
+
+```bash
+helm lint kubernetes/apps/online-boutique/
+```
+
+```
+==> Linting kubernetes/apps/online-boutique/
+[INFO] Chart.yaml: icon is recommended
+
+1 chart(s) linted, 0 chart(s) failed
+```
+
+![helm lint pass](docs/screenshots/43-helm-lint-pass.png)
+*helm lint — 1 chart linted, 0 failed. Chart is valid and ready to deploy.*
+
+`helm lint` checks that all templates are syntactically valid and all required values are present. The INFO about a missing icon is cosmetic — not an error. Running lint before every commit catches template errors before ArgoCD attempts to render them against the cluster.
+
+The first lint run failed — our initial `values.yaml` was missing the `frontend.virtualService` block that the template expected. The fix was to use Google's complete `values.yaml` as the base and add our ECR comment at the top.
+
+#### The ArgoCD Application Manifest
+
+ArgoCD learns about applications through `Application` manifests — Kubernetes custom resources that tell ArgoCD which Git repo to watch and where to deploy:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: online-boutique
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Dennis4507/cloudcommerce-devops.git
+    targetRevision: HEAD
+    path: kubernetes/apps/online-boutique
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: online-boutique
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+```
+
+Key fields:
+- `repoURL` — our GitHub repo, not Google's
+- `path` — where the Helm chart lives inside our repo
+- `automated` — ArgoCD syncs automatically on every git commit, no manual trigger needed
+- `prune: true` — resources removed from Git are also removed from the cluster
+- `selfHeal: true` — if someone manually changes the cluster, ArgoCD reverts it back to match Git
+- `CreateNamespace=true` — ArgoCD creates the `online-boutique` namespace automatically
+
+![ArgoCD Application manifest](docs/screenshots/44a-argocd-application-manifest.png)
+*kubernetes/argocd/online-boutique.yaml in VS Code — repoURL points at our GitHub repo, path points at our Helm chart, automated sync enabled*
+
+**What this teaches:** `values.yaml` is not configuration to be forgotten after setup — it is the live deployment contract between CI and CD. Every Jenkins build ends with a commit to this file. Every ArgoCD sync starts by reading it. Owning the chart in your own repo means owning the entire deployment lifecycle.
+
+---
+
 ### Progress
 - [x] k3s installed via Ansible — single-binary Kubernetes on EC2 t3.medium
 - [x] TLS SAN challenge diagnosed and resolved — public Elastic IP added to certificate via `--tls-san`
@@ -1012,7 +1133,10 @@ Opening `https://63.184.235.88:30080` shows the expected TLS warning — the sam
 - [x] kubectl PATH made permanent on Windows — works across all terminal sessions
 - [x] ArgoCD installed via Ansible — two kubectl apply challenges diagnosed and resolved
 - [x] ArgoCD UI accessible at https://63.184.235.88:30080 — GitOps engine live
-- [ ] Deploy Online Boutique via Helm
+- [x] Online Boutique Helm chart copied into repo — chart validated with helm lint
+- [x] ArgoCD Application manifest created — points at our repo, not Google's
+- [ ] Apply Application manifest — ArgoCD syncs and deploys all 12 services
+- [ ] Online Boutique accessible in browser
 - [ ] Configure Ingress
 - [ ] Set up HPA (Horizontal Pod Autoscaler)
 
