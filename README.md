@@ -480,7 +480,7 @@ Both servers responded immediately once the explicit flags were passed:
 With connectivity proven, the first playbook was written to install Jenkins. A single YAML file automates the complete setup: Java 17 (Jenkins runtime dependency), GPG key import, apt repository configuration, Jenkins installation and service management, Docker group membership for the jenkins user, and initial admin password retrieval.
 
 ![Jenkins Playbook](docs/screenshots/24-jenkins-playbook.png)
-*setup-jenkins.yml in VS Code — all tasks in sequence, from Java install to password retrieval*
+*setup-jenkins.yml in VS Code — initial version using Java 17, later upgraded to Java 21*
 
 ---
 
@@ -516,7 +516,18 @@ curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key | gpg --dear
 
 #### Problem 2 — Expired Key at the Official URL
 
-The same error after the dearmor fix indicated the key content was wrong, not just the format. The next step was SSH directly into the Jenkins server and inspect the actual key that was downloaded:
+The dearmor fix resolved the format issue but the same signature error persisted. More Ansible runs with further adjustments all produced the same result:
+
+![Ansible Jenkins Run Failed 4](docs/screenshots/25d-ansible-jenkins-run-failed4.png)
+*Fourth run — dearmor applied, same NO_PUBKEY error. The problem is not the format.*
+
+![Ansible Jenkins Run Failed 5](docs/screenshots/25e-ansible-jenkins-run-failed5.png)
+*Fifth run — all automated attempts exhausted. Root cause still unknown.*
+
+After five failures with the same error, automated retries were stopped. The next step was SSH directly into the Jenkins server to inspect what was actually on disk:
+
+![Jenkins Repo First Attempt](docs/screenshots/26a-jenkins-repo-first-attempt.png)
+*Manual commands on the server — checking the key file and testing apt-get update directly*
 
 ```bash
 gpg --show-keys /usr/share/keyrings/jenkins-keyring.gpg
@@ -530,18 +541,9 @@ pub   rsa4096 2023-03-27 [SC] [expired: 2026-03-26]
 ```
 
 ![Jenkins Wrong Key](docs/screenshots/26b-jenkins-wrong-key.png)
-*gpg --show-keys reveals the key downloaded from jenkins.io-2023.key URL — fingerprint 5BA31D57EF5975CA, expired March 2026*
+*gpg --show-keys reveals the key downloaded from jenkins.io-2023.key — fingerprint 5BA31D57EF5975CA, expired March 2026*
 
 The key at `jenkins.io-2023.key` **expired in March 2026**. Its fingerprint (`5BA31D57EF5975CA`) does not match the key Jenkins is actually using to sign the repository (`7198F4B714ABFC68`). Jenkins rotated their signing key but the old URL continues to serve the expired key — a silent trap for anyone following documentation written before the rotation.
-
-![Ansible Jenkins Run Failed 4](docs/screenshots/25d-ansible-jenkins-run-failed4.png)
-*Fourth run — dearmor correct, but expired key from URL causes the same signature failure*
-
-![Ansible Jenkins Run Failed 5](docs/screenshots/25e-ansible-jenkins-run-failed5.png)
-*Fifth run — all automated retries failed before manual server inspection identified the root cause*
-
-![Jenkins Repo First Attempt](docs/screenshots/26a-jenkins-repo-first-attempt.png)
-*Manual commands on the server — isolating whether the issue was the playbook or the key itself*
 
 ---
 
@@ -565,11 +567,95 @@ A keyserver lookup by ID always returns the current valid key for that ID. The p
 
 ---
 
+### Challenge: Jenkins Installed but Service Failed to Start — Java Version
+
+With the GPG key issue resolved, the playbook ran successfully — Jenkins installed — but failed at the final step: starting the service.
+
+```
+TASK [Start and enable Jenkins]
+fatal: [3.127.90.169]: FAILED! => {"msg": "Unable to start service jenkins: Job for
+jenkins.service failed because the control process exited with error code."}
+```
+
+![Jenkins Service Start Failed](docs/screenshots/27a-jenkins-service-start-failed.png)
+*Ansible output — ok=6, changed=2, failed=1. Jenkins installed successfully but service refused to start*
+
+The systemctl and journalctl logs showed only that the process exited — not why. The fastest way to get the actual error was to run Jenkins directly:
+
+```bash
+sudo /usr/bin/jenkins
+```
+
+Output:
+
+```
+Running with Java 17 from /usr/lib/jvm/java-17-openjdk-amd64, which is older than
+the minimum required version (Java 21).
+Supported Java versions are: [21, 25]
+```
+
+![Jenkins Java 17 Not Supported](docs/screenshots/27b-jenkins-java17-not-supported.png)
+*Jenkins executed directly — Java 17 rejected, minimum requirement is now Java 21*
+
+**Root cause:** Jenkins dropped Java 17 support in recent releases. The playbook was written against older documentation that listed Java 17 as the supported version. The current Jenkins LTS requires Java 21 minimum.
+
+**Fix:** Update the playbook to remove Java 17 and install Java 21. Java 17 takes ~200MB — removing it also keeps disk usage clean on the 20GB t2.micro volume.
+
+```yaml
+- name: Remove Java 17 if present
+  apt:
+    name: openjdk-17-jdk
+    state: absent
+
+- name: Install Java 21 and dependencies
+  apt:
+    name:
+      - openjdk-21-jdk
+      - curl
+      - gnupg
+    state: present
+```
+
+![Playbook Java 21 Fix](docs/screenshots/27c-playbook-java21-fix.png)
+*Updated playbook — Java 17 removal task added before Java 21 install*
+
+Re-running the playbook: Ansible removed Java 17, installed Java 21, and this time Jenkins started cleanly.
+
+![Ansible Java Upgrade Running](docs/screenshots/27d-ansible-java-upgrade-running.png)
+*Ansible run in progress — Java 17 removed (changed), Java 21 installed (changed)*
+
+![Ansible Jenkins Install Success](docs/screenshots/27e-ansible-jenkins-install-success.png)
+*Full successful run — 12 tasks ok, 5 changed, 0 failed. Jenkins started and initial password retrieved*
+
+**What this teaches:** Software version requirements change. Locking to a specific version in automation and re-verifying after major releases is not optional — Jenkins silently accepted the wrong Java version at install time and only rejected it at runtime. Running the binary directly (`/usr/bin/jenkins`) is a fast diagnostic technique that bypasses systemd's wrapper and surfaces the real error immediately.
+
+---
+
+### Jenkins Initial Configuration
+
+With Jenkins running, the web UI was opened at `http://3.127.90.169:8080`. The initial unlock screen requires the admin password that Ansible printed at the end of the playbook run.
+
+![Jenkins Unlock Page](docs/screenshots/27f-jenkins-unlock-page.png)
+*Jenkins unlock screen — initial admin password retrieved from Ansible output*
+
+**Suggested plugins** were selected — this installs the standard set Jenkins recommends: Git, Pipeline, Credentials, GitHub integration, and build tools. Selecting plugins manually at this stage adds risk of missing dependencies with no benefit.
+
+![Jenkins Plugins Installing](docs/screenshots/28-jenkins-unlock-plugins.png)
+*Suggested plugins installing — Git, Pipeline, Credentials, GitHub, and supporting tools*
+
+An admin account was created and Jenkins is now fully operational.
+
+![Jenkins Dashboard](docs/screenshots/29-jenkins-dashboard.png)
+*Jenkins dashboard — CI/CD server live and accessible at http://3.127.90.169:8080*
+
+---
+
 ### Progress
 - [x] Ansible connectivity verified — both servers reachable (ping: pong)
-- [x] Jenkins GPG key issue diagnosed and resolved — keyserver approach adopted in final playbook
-- [ ] Install Jenkins via Ansible (playbook ready — run pending)
-- [ ] Configure Jenkins (plugins, credentials, pipeline)
+- [x] Jenkins GPG key issue diagnosed and resolved — keyserver approach adopted
+- [x] Jenkins installed via Ansible — Java 17→21 upgrade required and documented
+- [x] Jenkins configured — admin account created, suggested plugins installed
+- [ ] Add AWS credentials and GitHub token to Jenkins credential store
 - [ ] Write Jenkinsfile — build, scan with Trivy, push to ECR
 - [ ] Configure GitHub webhook → Jenkins trigger
 - [ ] Set up ArgoCD for GitOps deployment

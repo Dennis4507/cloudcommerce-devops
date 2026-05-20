@@ -5,10 +5,15 @@
 
   tasks:
 
-    - name: Install Java 17 and dependencies
+    - name: Remove Java 17 if present
+      apt:
+        name: openjdk-17-jdk
+        state: absent
+
+    - name: Install Java 21 and dependencies
       apt:
         name:
-          - openjdk-17-jdk
+          - openjdk-21-jdk
           - curl
           - gnupg
         state: present

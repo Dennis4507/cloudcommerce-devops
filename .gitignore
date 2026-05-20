@@ -23,8 +23,8 @@ secrets.yaml
 *accessKeys*
 *credentials*
 
-# Local runtime info
-server-ips.txt
+# Local runtime info (IPs, passwords, initial credentials)
+secrets-and-ips.txt
 
 # OS files
 .DS_Store
