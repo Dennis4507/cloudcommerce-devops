@@ -907,13 +907,111 @@ New terminal sessions inherit the updated PATH automatically — no manual setup
 
 ---
 
+### Installing ArgoCD — GitOps Continuous Delivery
+
+ArgoCD is the GitOps engine for this platform. Where Jenkins handles CI (build, scan, push), ArgoCD handles CD — it watches a Git repository and automatically syncs the cluster state to match what's defined there. Every deployment is a git commit. Every rollback is a git revert. The cluster always reflects what's in the repository.
+
+#### Why Ansible Instead of Raw kubectl
+
+The initial instinct was to run the ArgoCD install as a one-off `kubectl apply` command. The better approach — and the one taken here — was to write it as an Ansible playbook. The reasons:
+
+- **Reproducibility:** the entire ArgoCD setup can be re-run from scratch on any cluster with one command
+- **Documentation:** the playbook is the install record — no undocumented steps
+- **Consistency:** all infrastructure changes in this project go through the same IaC discipline
+- **Recovery:** if the cluster is rebuilt, `ansible-playbook setup-argocd.yml` restores the full GitOps layer automatically
+
+A one-off kubectl command works once. An Ansible playbook works every time.
+
+---
+
+#### Challenge 1 — Annotation Too Large for Client-Side Apply
+
+The first playbook run failed immediately:
+
+```
+The CustomResourceDefinition "applicationsets.argoproj.io" is invalid:
+metadata.annotations: Too long: may not be more than 262144 bytes
+```
+
+![ArgoCD install failed](docs/screenshots/37-argocd-install-failed.png)
+*First ArgoCD playbook run — FAILED. The applicationsets CRD annotation exceeds Kubernetes' 262144 byte limit*
+
+**Root cause:** `kubectl apply` in its default (client-side) mode stores the entire last-applied manifest as an annotation on the resource. ArgoCD's ApplicationSet CRD is large enough that this annotation exceeds the 262144 byte hard limit Kubernetes enforces on annotations.
+
+**Fix:** Switch to `--server-side` apply, which moves the field management tracking to the server and does not write the manifest into an annotation.
+
+```yaml
+shell: k3s kubectl apply -n argocd --server-side -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+```
+
+![ArgoCD server-side fix](docs/screenshots/37a-argocd-serverside-fix.png)
+*Playbook updated — --server-side flag added to the kubectl apply command*
+
+---
+
+#### Challenge 2 — Field Manager Conflict Between Apply Modes
+
+The second run failed with a different error:
+
+```
+Apply failed with 1 conflict: conflict with "kubectl-client-side-apply" using apps/v1:
+.spec.template.spec.containers[name="argocd-applicationset-controller"].env[name="NAMESPACE"].valueFrom.fieldRef
+```
+
+![ArgoCD second run failed](docs/screenshots/37b-argocd-second-run-failed.png)
+*Second run — FAILED. Server-side apply conflicts with the client-side apply manager from the first run*
+
+**Root cause:** The first run created resources using client-side apply, which registers `kubectl-client-side-apply` as the field manager. The second run is now using server-side apply, which uses a different field manager. Kubernetes rejected the handover because two managers were claiming ownership of the same fields.
+
+**Fix:** Add `--force-conflicts` to instruct server-side apply to take ownership of all conflicting fields, overriding the previous client-side manager:
+
+```yaml
+shell: k3s kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+```
+
+![ArgoCD force-conflicts fix](docs/screenshots/37c-argocd-force-conflicts-fix.png)
+*Playbook updated again — --force-conflicts added to resolve field manager conflict*
+
+---
+
+#### ArgoCD Installation Success
+
+Third run — all 7 tasks completed, 0 failed:
+
+![ArgoCD install success](docs/screenshots/38-argocd-install-success.png)
+*Full successful run — namespace created, ArgoCD installed, pods ready, service patched to NodePort 30080, initial password printed*
+
+```
+ArgoCD UI: https://63.184.235.88:30080 | username: admin | password: ****
+```
+
+---
+
+#### ArgoCD UI — First Login
+
+Opening `https://63.184.235.88:30080` shows the expected TLS warning — the same self-signed certificate situation as with the k3s API server. Click through to reach the login page.
+
+![ArgoCD TLS warning](docs/screenshots/39-argocd-tls-warning.png)
+*Browser TLS warning — self-signed cert, same as kubectl. Expected and safe to proceed.*
+
+![ArgoCD login page](docs/screenshots/40-argocd-login-page.png)
+*ArgoCD login page — accessible at https://63.184.235.88:30080*
+
+![ArgoCD dashboard](docs/screenshots/41-argocd-dashboard.png)
+*ArgoCD dashboard — no applications yet. The GitOps engine is running and waiting for its first app definition.*
+
+**What this teaches:** ArgoCD's install manifest includes CRDs large enough to break the default kubectl apply path — a well-known issue with CRD-heavy operators. The fix (server-side apply with force-conflicts) is the documented solution and is now standard practice for any large CRD installation. Running this through Ansible means the fix is captured in code and never needs to be rediscovered.
+
+---
+
 ### Progress
 - [x] k3s installed via Ansible — single-binary Kubernetes on EC2 t3.medium
 - [x] TLS SAN challenge diagnosed and resolved — public Elastic IP added to certificate via `--tls-san`
 - [x] kubectl installed and configured — remote cluster access from local machine confirmed
 - [x] k9s v0.50.18 installed — terminal UI showing all 7 system pods Running
 - [x] kubectl PATH made permanent on Windows — works across all terminal sessions
-- [ ] Install ArgoCD on k3s cluster
+- [x] ArgoCD installed via Ansible — two kubectl apply challenges diagnosed and resolved
+- [x] ArgoCD UI accessible at https://63.184.235.88:30080 — GitOps engine live
 - [ ] Deploy Online Boutique via Helm
 - [ ] Configure Ingress
 - [ ] Set up HPA (Horizontal Pod Autoscaler)
