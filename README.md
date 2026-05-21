@@ -1774,13 +1774,109 @@ Push any change to `microservices-demo` to trigger the webhook. This time Jenkin
 
 ---
 
+### Incident 3 — Jenkins Reinstallation: GPG Key Mismatch
+
+After the Terraform AMI incident destroyed both servers, the Jenkins Ansible playbook was run to rebuild from scratch. It failed four times in a row before succeeding. Here is exactly what happened and why.
+
+**What happened — in simple terms:**
+
+When Ubuntu installs software from a third-party source like Jenkins, it first asks: "can I trust this source?" To answer that, it checks a digital stamp called a GPG key — like a wax seal on an envelope proving the letter is genuine. If the seal doesn't match, Ubuntu refuses to open the envelope and install anything.
+
+We had the right envelope (Jenkins repository) but kept presenting the wrong stamp. Ubuntu refused every time.
+
+**The four failed attempts:**
+
+**Attempt 1 — Original playbook, keyserver method:**
+
+The playbook fetched the Jenkins key from a public key directory (keyserver.ubuntu.com) and stored it in a custom file. The key was imported but in the wrong format — like a photocopy of a stamp instead of the real one. Ubuntu checked it and rejected it.
+
+![Ansible Jenkins GPG error 1](docs/screenshots/101-ansible-jenkins-gpg-error-1.png)
+*First Ansible run — `failed=1` at the Update apt cache step; Ubuntu refuses to trust the Jenkins repository because the GPG key format is wrong*
+
+**Attempt 2 — Reordered playbook, same key method:**
+
+The tasks were reordered so the key import happened before the Java installation (to stop the failed apt update blocking Java). The key was still wrong. Same error.
+
+![Ansible Jenkins GPG error 2](docs/screenshots/102-ansible-jenkins-gpg-error-2.png)
+*Second attempt — same `NO_PUBKEY 7198F4B714ABFC68` error; reordering tasks fixed the sequence but not the underlying key mismatch*
+
+**Attempt 3 — Downloaded key directly from Jenkins website (armored format):**
+
+Instead of the keyserver, the key was downloaded straight from Jenkins' own website (`jenkins.io-2023.key`) and saved as `.asc` format. The download succeeded but the key in that file had a **different ID** than the one Jenkins used to sign their packages. Ubuntu compared the two — they didn't match — and refused again.
+
+![Playbook GPG armored fix](docs/screenshots/105-playbook-gpg-armored-fix.png)
+*VS Code showing the playbook update — switching from keyserver to direct download from Jenkins' website in an attempt to fix the key mismatch*
+
+![Ansible Jenkins GPG error 3](docs/screenshots/103-ansible-jenkins-gpg-error-3.png)
+*Third attempt — key downloaded successfully but still wrong ID; the `jenkins.io-2023.key` file contains a different key than the one that signed the stable repository*
+
+**Attempt 4 — Downloaded and converted the key (dearmor):**
+
+The same key was downloaded and run through a conversion tool (`gpg --dearmor`) to change its format. The format was still wrong and the key ID was still the wrong one.
+
+![Playbook GPG direct download fix](docs/screenshots/106-playbook-gpg-direct-download-fix.png)
+*VS Code diff — the playbook change showing the direct download + dearmor conversion attempt. Red lines removed, green lines added.*
+
+![Ansible Jenkins GPG error 4](docs/screenshots/104-ansible-jenkins-gpg-error-4.png)
+*Fourth attempt — still `NO_PUBKEY 7198F4B714ABFC68`; converting the key format did not help because the key ID itself was wrong*
+
+**The fix — fetch the exact key by its ID:**
+
+Instead of guessing which file contained the right key, the playbook was updated to tell Ubuntu: "go and fetch exactly key number `7198F4B714ABFC68` from the Ubuntu key directory — the same key Jenkins used to sign their packages." Ubuntu fetched that exact key, matched it to the Jenkins repository signature, and accepted it.
+
+```yaml
+- name: Import Jenkins GPG key by exact key ID
+  shell: |
+    gpg --batch --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 7198F4B714ABFC68
+    gpg --batch --export --armor 7198F4B714ABFC68 > /usr/share/keyrings/jenkins-keyring.asc
+```
+
+**Why this happened now but not before:** The newer Ubuntu AMI (created after the Terraform incident) has a stricter version of apt that verifies the key ID more precisely. The original server was more lenient. Same principle, tighter enforcement.
+
+![Ansible Jenkins success](docs/screenshots/107-ansible-jenkins-success.png)
+*Fifth attempt — `ok=15, changed=7, failed=0`. Jenkins, Trivy, and AWS CLI all installed successfully. Initial admin password printed (redacted).*
+
+---
+
+### Jenkins UI Setup After Reinstallation
+
+With Jenkins installed and running, the browser was opened at `http://3.127.90.169:8080`. The initial setup wizard appeared.
+
+**Step 1 — Install suggested plugins:**
+
+![Jenkins welcome install plugins](docs/screenshots/108-jenkins-welcome-install-plugins.png)
+*Jenkins first-run wizard — "Install suggested plugins" selected. This installs Git, Pipeline, GitHub integration, and Credentials in one click.*
+
+![Jenkins suggested plugins installing](docs/screenshots/109-jenkins-suggested-plugins-installing.png)
+*Plugins installing — green checkmarks appearing as each plugin completes. Pipeline, Git, GitHub Branch Source, and all core plugins installed successfully.*
+
+**Step 2 — Install Docker Pipeline plugin:**
+
+The suggested plugin set does not include the Docker Pipeline plugin, which our Jenkinsfile needs to build Docker images inside the pipeline. It was installed separately from the Plugin Manager.
+
+![Docker Pipeline plugin installed](docs/screenshots/111-docker-pipeline-plugin-installed.png)
+*Plugin Manager — Docker Pipeline showing "Erfolgreich" (Success). All plugins Jenkins needs for our CI/CD pipeline are now installed.*
+
+**Step 3 — Log in to Jenkins dashboard:**
+
+After creating an admin account, Jenkins is fully operational and ready for the pipeline job to be recreated.
+
+![Jenkins dashboard logged in](docs/screenshots/110-jenkins-dashboard-logged-in.png)
+*Jenkins dashboard — "Willkommen bei Jenkins!" (Welcome to Jenkins!). Clean dashboard, no jobs yet. Ready to recreate the cloudcommerce-frontend pipeline.*
+
+---
+
 ### Progress
 - [x] Jenkins pipeline job created — cloudcommerce-frontend pointing at microservices-demo
 - [x] GitHub webhook configured — push to microservices-demo triggers Jenkins instantly
 - [x] OOM crash diagnosed — Jenkins server ran out of memory during Go compilation
 - [x] Terraform AMI incident — both servers accidentally destroyed and recreated, lifecycle fix applied
-- [ ] Rebuild Jenkins and k3s via Ansible playbooks
-- [ ] Reconfigure Jenkins — plugins, credentials, pipeline job
+- [x] Jenkins reinstalled via Ansible — GPG key mismatch resolved after 4 failed attempts
+- [x] Jenkins UI configured — suggested plugins, Docker Pipeline, admin account created
+- [ ] Add Jenkins credentials — GitHub token and AWS account ID
+- [ ] Recreate cloudcommerce-frontend pipeline job
+- [ ] Rebuild k3s via Ansible playbook
+- [ ] Reinstall ArgoCD
 - [ ] Redeploy Online Boutique via ArgoCD
 - [ ] Run first successful full pipeline build
 

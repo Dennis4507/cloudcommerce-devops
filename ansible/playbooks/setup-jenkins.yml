@@ -5,6 +5,26 @@
 
   tasks:
 
+    - name: Remove stale Jenkins keyring files if present
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /usr/share/keyrings/jenkins-keyring.gpg
+        - /usr/share/keyrings/jenkins-keyring.asc
+        - /etc/apt/sources.list.d/jenkins.list
+
+    - name: Import Jenkins GPG key by exact key ID
+      shell: |
+        gpg --batch --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 7198F4B714ABFC68
+        gpg --batch --export --armor 7198F4B714ABFC68 > /usr/share/keyrings/jenkins-keyring.asc
+        chmod 644 /usr/share/keyrings/jenkins-keyring.asc
+
+    - name: Add Jenkins apt repository
+      shell: |
+        echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/" \
+          > /etc/apt/sources.list.d/jenkins.list
+
     - name: Remove Java 17 if present
       apt:
         name: openjdk-17-jdk
@@ -18,27 +38,6 @@
           - gnupg
           - unzip
         state: present
-        update_cache: yes
-
-    - name: Import Jenkins GPG key from keyserver
-      shell: |
-        gpg --no-default-keyring \
-            --keyring /usr/share/keyrings/jenkins-keyring.gpg \
-            --keyserver keyserver.ubuntu.com \
-            --recv-keys 7198F4B714ABFC68
-        chmod 644 /usr/share/keyrings/jenkins-keyring.gpg
-      args:
-        creates: /usr/share/keyrings/jenkins-keyring.gpg
-
-    - name: Add Jenkins apt repository
-      shell: |
-        echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.gpg] https://pkg.jenkins.io/debian-stable binary/" \
-          > /etc/apt/sources.list.d/jenkins.list
-      args:
-        creates: /etc/apt/sources.list.d/jenkins.list
-
-    - name: Update apt cache
-      apt:
         update_cache: yes
 
     - name: Install Jenkins

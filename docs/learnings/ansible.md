@@ -369,6 +369,66 @@ cp /mnt/c/Users/OnlyM/.../cloudcommerce-dev-key ~/.ssh/
 chmod 600 ~/.ssh/cloudcommerce-dev-key
 ```
 
+## GPG Keys — How Ubuntu Verifies Third-Party Software
+
+When Ubuntu installs software from a third-party source (like Jenkins), it does not just download and install it blindly. It first checks a digital signature — called a GPG key — to verify that the software genuinely came from Jenkins and has not been tampered with. Think of it like a wax seal on a letter: before opening it, you check the seal matches the sender.
+
+Every apt repository has a release file that is signed with a specific GPG key. Ubuntu's apt looks at that signature, then searches its trusted keyring for the matching key. If it finds a match — trusted. If not — rejected.
+
+```
+Jenkins Repository
+  └── Release file (signed with key ID: 7198F4B714ABFC68)
+          │
+          ▼
+Ubuntu apt checks trusted keyring for key 7198F4B714ABFC68
+  └── Found? → Install allowed
+  └── Not found? → "NO_PUBKEY 7198F4B714ABFC68" error
+```
+
+## The Jenkins GPG Key Incident — A Real Debugging Session
+
+During the Jenkins reinstallation after the Terraform AMI incident, the Ansible playbook failed four times with the same error:
+
+```
+NO_PUBKEY 7198F4B714ABFC68
+E:The repository 'https://pkg.jenkins.io/debian-stable binary/ Release' is not signed.
+```
+
+**Why the original server never had this problem:** The original playbook used the older `apt-key` approach which was less strict about key format and placement. The newer Ubuntu AMI (after the AMI incident) has a stricter version of apt that enforces exact key ID matching. Same principle, tighter enforcement.
+
+**Attempt 1 — keyserver with custom keyring:**
+```bash
+gpg --keyring /usr/share/keyrings/jenkins-keyring.gpg \
+    --keyserver keyserver.ubuntu.com --recv-keys 7198F4B714ABFC68
+```
+The key was stored in a custom keyring file but in the wrong binary format for apt's `signed-by` directive. The key existed but apt could not read it.
+
+**Attempt 2 — reordered tasks:**
+The key import and repository tasks were moved before the Java install task. This fixed the ordering but not the key format. Same error.
+
+**Attempt 3 — downloaded from Jenkins website:**
+```bash
+wget -O /usr/share/keyrings/jenkins-keyring.asc https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+```
+The `jenkins.io-2023.key` file was downloaded and saved directly. But this file contains a **different key ID** than `7198F4B714ABFC68`. The Jenkins stable repository is signed with one key; the 2023 key file contains a different one. Presenting the wrong key to apt still fails.
+
+**Attempt 4 — downloaded and converted:**
+```bash
+curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key | gpg --dearmor -o /usr/share/keyrings/jenkins-keyring.gpg
+```
+Same wrong key, different format. Still no match.
+
+**The fix — fetch the exact key by its ID:**
+```bash
+gpg --batch --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 7198F4B714ABFC68
+gpg --batch --export --armor 7198F4B714ABFC68 > /usr/share/keyrings/jenkins-keyring.asc
+```
+Instead of guessing which file contained the right key, we told the keyserver: "give me exactly key `7198F4B714ABFC68`." That key is exactly what the Jenkins stable repository was signed with. Ubuntu checked it, found a match, and allowed the installation.
+
+**The lesson:** When apt reports `NO_PUBKEY XXXX`, the error message is telling you exactly which key it needs. Import that specific key by its ID — do not guess which key file from the vendor's website contains it.
+
+**Task ordering matters:** Any task with `update_cache: yes` in the `apt` module triggers a full apt update across all repositories — including Jenkins. If the Jenkins repository is already added (from a previous failed run) but the key is wrong, even installing unrelated packages like Java will fail. The key and repository setup must always come first in the playbook.
+
 ## Interview Talking Points
 
 - "I use Ansible for server configuration because it's agentless — there's nothing to install or maintain on target servers, which reduces attack surface and operational overhead"
@@ -377,5 +437,7 @@ chmod 600 ~/.ssh/cloudcommerce-dev-key
 - "I use the `creates` argument on shell tasks to make them idempotent — the task is skipped if the target file already exists"
 - "I always test connectivity with `ansible all -m ping` before running playbooks — this catches SSH or inventory issues before a long playbook run fails partway through"
 - "I learned the hard way that `changed` in Ansible means the task ran — not that it succeeded. A shell task whose last command exits 0 will report changed even if every meaningful step before it failed. I now add `set -e` to all multi-step shell scripts"
+- "When apt reports `NO_PUBKEY XXXX`, that error message tells you exactly which key you need. I spent four failed attempts importing the wrong key before I understood the correct fix: fetch that exact key ID from the keyserver rather than guessing which vendor file contains it"
+- "Task ordering in Ansible matters — any `apt` task with `update_cache: yes` refreshes all repositories, including ones added by earlier tasks. If a repository is configured with a bad key, even installing unrelated packages will fail. Key and repository setup must always come first"
 - "I use `failed_when: false` on tasks that may legitimately return a non-zero exit code — like reading the Jenkins initial admin password file, which only exists on first setup"
 - "On a t2.micro with 1GB RAM, Jenkins holds ~600MB. Any system maintenance must be done with Jenkins stopped — otherwise apt cannot allocate the memory it needs to install packages"

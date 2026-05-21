@@ -42,7 +42,7 @@ Every successful pipeline run automatically deploys to production without human 
 
 Jenkins is a self-hosted, open-source automation server. It orchestrates CI/CD pipelines — listening for triggers (GitHub webhook, schedule, manual), running jobs, and reporting results.
 
-Jenkins runs as a server (on our EC2 t2.micro) and exposes a web UI at port 8080. Pipelines are defined in a `Jenkinsfile` — a Groovy-based DSL that sits in the repository root.
+Jenkins runs as a server (on our EC2 t3.medium — 4GB RAM) and exposes a web UI at port 8080. Pipelines are defined in a `Jenkinsfile` — a Groovy-based DSL that sits in the repository root.
 
 **Why Jenkins over managed alternatives (GitHub Actions, CircleCI)?**
 - Jenkins runs on your infrastructure — no per-minute billing for compute
@@ -141,13 +141,20 @@ Jenkins is a framework. Almost all functionality comes from plugins — there ar
 - Git / GitHub integration
 - Pipeline (the `Jenkinsfile` DSL)
 - Credentials (secure secret storage)
-- Blue Ocean (modern pipeline UI)
-- Docker Pipeline
 - Workspace management
+- Matrix Authorization, Mailer, and other core utilities
 
 **Select plugins to install** — choose manually from the full list.
 
 For initial setup, suggested plugins is the correct choice. Selecting manually risks missing transitive dependencies and produces a half-configured Jenkins with cryptic errors when you try to build pipelines. Additional plugins can always be added later.
+
+**Docker Pipeline is NOT included in suggested plugins.** This was discovered during reinstallation — the suggested set does not include Docker Pipeline, which is required for any Jenkinsfile that builds Docker images. It must be installed separately after initial setup:
+
+```
+Manage Jenkins → Plugins → Available plugins → search "Docker Pipeline" → Install
+```
+
+Without Docker Pipeline, any `docker.build()` or `docker.withRegistry()` call in a Jenkinsfile will fail with an unrecognised step error.
 
 ## Jenkins Credentials Store
 
@@ -448,3 +455,5 @@ Without the webhook, Jenkins polls GitHub every few minutes — there's a delay 
 - "The [skip ci] flag in the values.yaml commit prevents an infinite loop — without it, Jenkins writing to the infra repo would trigger another Jenkins build"
 - "The Jenkinsfile lives in the application repository alongside the code it builds — pipeline changes go through the same git review discipline as application changes"
 - "Two repos keep concerns separated: developers push to microservices-demo, Jenkins triggers, ArgoCD reads cloudcommerce-devops. Each team's scope is clear"
+- "Docker Pipeline is not included in the Jenkins suggested plugins — it must be installed separately. Without it, any pipeline that calls docker.build() will fail. I learned this during reinstallation when I had to manually search and install it after the suggested plugins completed"
+- "Jenkins was upgraded from t2.micro (1GB RAM) to t3.medium (4GB RAM) after the Go compiler triggered an OOM kill during the first build. A t2.micro cannot run the Jenkins JVM and compile a Go binary at the same time — there is simply not enough memory"
