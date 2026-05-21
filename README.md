@@ -28,7 +28,7 @@ Developer pushes code to GitHub
          │
          ▼ webhook
     ┌─────────────┐
-    │   Jenkins   │  ← CI/CD on EC2 t2.micro (eu-central-1)
+    │   Jenkins   │  ← CI/CD on EC2 t3.medium (eu-central-1)
     │  Pipeline   │    Build → Scan → Push → Trigger
     └──────┬──────┘
            │ triggers ArgoCD sync
@@ -1463,12 +1463,326 @@ AWS CLI verified on the server:
 - [x] Online Boutique fully functional — products, cart, and checkout all working
 - [x] Jenkins credentials configured — GitHub token and AWS account ID secured
 - [x] Application repo created — Dennis4507/microservices-demo owns the application source
+### Creating the Jenkins Pipeline Job
+
+With Trivy and AWS CLI installed, Jenkins was ready to run the pipeline. A pipeline job was created in the Jenkins UI pointing at the `microservices-demo` application repository.
+
+**Job configuration:**
+- **Type:** Pipeline
+- **Trigger:** GitHub hook trigger for GITScm polling — Jenkins listens for webhook events from GitHub
+- **Definition:** Pipeline script from SCM — Jenkins reads the Jenkinsfile from the repository, not from the UI
+- **SCM:** Git
+- **Repository:** `https://github.com/Dennis4507/microservices-demo.git`
+- **Credentials:** None — the repo is public, no authentication needed to clone
+- **Branch:** `*/main`
+- **Script Path:** `Jenkinsfile`
+
+![Jenkins pipeline config](docs/screenshots/74-jenkins-pipeline-config.png)
+*cloudcommerce-frontend pipeline job — GitHub hook trigger enabled, Pipeline script from SCM pointing at microservices-demo*
+
+![Jenkins pipeline setup](docs/screenshots/98-jenkins-pipeline-setup.png)
+*Jenkins Configure page — "GitHub hook trigger for GITScm polling" enabled (checked) so every git push fires a build, and Pipeline definition set to "Pipeline script from SCM" so Jenkins reads the Jenkinsfile from the repository*
+
+![Jenkins cloudcommerce frontend job](docs/screenshots/99-jenkins-cloudcommerce-frontend.png)
+*Jenkins main dashboard — cloudcommerce-frontend pipeline job listed with a build in progress (blue spinner), no successful or failed builds yet since it was just created*
+
+**Why Pipeline script from SCM instead of writing the script in the UI?**
+
+The Jenkinsfile lives in the same repository as the application code. This means:
+- Pipeline changes are reviewed alongside application changes
+- The pipeline is version controlled — you can see exactly what changed and when
+- Any developer cloning the repo gets the pipeline definition automatically
+- Jenkins always runs the pipeline version that matches the code being built
+
+Writing the pipeline directly in the Jenkins UI would mean it lives only in Jenkins — invisible to git, unreviewed, and disconnected from the code it builds.
+
+---
+
+### GitHub Webhook — Instant Trigger on Push
+
+A webhook was configured on the `microservices-demo` repository so that every `git push` immediately triggers a Jenkins build — no polling delay.
+
+**Webhook settings:**
+- **Payload URL:** `http://3.127.90.169:8080/github-webhook/`
+- **Content type:** `application/json`
+- **Events:** Push only
+
+![GitHub webhook setup](docs/screenshots/75-github-webhook-setup.png)
+*GitHub webhook form — Payload URL pointing at Jenkins, application/json content type, push events only*
+
+![Setting up GitHub webhooks](docs/screenshots/96-setting-up-github-webhooks.png)
+*Webhook configuration in GitHub — Payload URL and content type filled in before saving*
+
+![GitHub webhook success](docs/screenshots/76-github-webhook-success.png)
+*Webhook confirmed — green tick, "Last delivery was successful"*
+
+![GitHub webhook delivery success](docs/screenshots/97-github-webhook-delivery-success.png)
+*GitHub Webhooks page — green checkmark and "Last delivery was successful" confirms Jenkins received and processed the push event from GitHub*
+
+**Without the webhook:** Jenkins would poll GitHub every few minutes — there would be a delay between pushing code and the build starting.
+
+**With the webhook:** GitHub sends a POST request to Jenkins the instant a push happens. The build starts within seconds.
+
+---
+
+### First Build — Triggered by Webhook
+
+The webhook was tested immediately by pushing a small change to `microservices-demo`:
+
+```bash
+echo "# CloudCommerce CI/CD" >> README.md
+git add README.md
+git commit -m "ci: trigger first Jenkins build"
+git push
+```
+
+![Trigger test build](docs/screenshots/95-trigger-test-build.png)
+*WSL terminal — making a small change to microservices-demo and pushing to trigger the Jenkins webhook and start build #1*
+
+![Trigger first build](docs/screenshots/77-trigger-first-build-push.png)
+*WSL terminal — git push to microservices-demo triggers the GitHub webhook, Jenkins receives the event and starts build #1*
+
+Jenkins received the webhook and started build #1 immediately:
+
+![Jenkins dashboard job](docs/screenshots/78-jenkins-dashboard-job.png)
+*Jenkins dashboard — cloudcommerce-frontend job visible, build #1 in progress*
+
+![Jenkins build loading](docs/screenshots/79-jenkins-build-loading.png)
+*Jenkins job page loading — the UI is slow because Jenkins JVM is actively running the build on a 1GB t2.micro*
+
+![Jenkins build running](docs/screenshots/80-jenkins-build-running.png)
+*Build #1 running — started 10 minutes ago, Docker image compilation in progress*
+
+![Jenkins building](docs/screenshots/100-jenkins-building.png)
+*Jenkins cloudcommerce-frontend build #1 — started 10 minutes ago, progress bar still running, no estimated finish time (the Go compiler is using all available RAM and the build is effectively stalled)*
+
+![Jenkins webhook received slow](docs/screenshots/94-jenkins-webhook-received-slow.png)
+*Jenkins cloudcommerce-frontend job page — Jenkins received the build via the GitHub webhook (Last Build #1 visible) but the builds list is still "Loading..." because the server is too slow to respond; the browser tab is still spinning*
+
+The build console confirmed the full pipeline in motion:
+- ✅ Webhook fired by GitHub push
+- ✅ Jenkinsfile read from `microservices-demo` repository
+- ✅ Image tag set to `9f2ba8cf` (git commit short hash)
+- ✅ ECR login succeeded — IAM instance profile authentication working
+- ✅ Docker build started — Go frontend binary compiling from source
+
+---
+
+### Progress
 - [x] Trivy installed on Jenkins server — image scanning ready
 - [x] AWS CLI installed on Jenkins server — ECR authentication ready
 - [x] t2.micro memory constraint understood — stop Jenkins before system maintenance
-- [ ] Create Jenkins pipeline job pointing at microservices-demo
-- [ ] Configure GitHub webhook → Jenkins trigger
-- [ ] Run first full pipeline build → ECR → values.yaml update → ArgoCD deploy
+---
+
+### Incident 1 — Jenkins Server Ran Out of Memory (OOM Crash)
+
+**What happened — in simple terms:**
+
+Think of RAM (memory) like a desk. The more things you have open on your desk, the more space you need. Our Jenkins server had a small desk (1GB RAM). Jenkins itself was already taking up most of it. When the pipeline started building the frontend — which involves compiling Go code, a heavy task — there was no room left. The operating system, unable to fit everything, started forcibly closing programs to survive. The build died silently. The server became unresponsive.
+
+**The technical detail:**
+
+The t2.micro instance has 1GB RAM and no swap space. Jenkins JVM holds ~600MB at runtime. The Go compiler needs ~400-500MB to compile the frontend service. 600 + 500 = 1100MB — more than the 1000MB available. The Linux OOM (Out of Memory) killer terminated the Go compiler process. Jenkins was left waiting for a process that was already dead. The server became too memory-starved to even serve the web UI.
+
+![Jenkins sluggish webhook](docs/screenshots/81-jenkins-sluggish-webhook.png)
+*Jenkins build #1 Changes tab — page is blank with a loading spinner, taking too long to load after the webhook triggered the build; the t2.micro had no memory left during Go compilation*
+
+![OOM diagnosis](docs/screenshots/82-oom-diagnosis.png)
+*WSL terminal during the OOM incident — SSH into Jenkins hangs and has to be cancelled (^C) because the server is too memory-starved to respond; this confirmed the server was unreachable without a reboot*
+
+**How it was diagnosed:**
+
+```bash
+free -h
+# available: 100Mi  ← only 100MB free while build was running
+# available: 70Mi   ← server nearly unresponsive
+```
+
+After the server stopped responding to SSH entirely, the instance was rebooted from the AWS console.
+
+![Reboot instance](docs/screenshots/83-reboot-instance.png)
+*AWS console — Reboot Instance used to bring Jenkins back after OOM kill made SSH impossible*
+
+![Server back low memory](docs/screenshots/84-server-back-low-memory.png)
+*Server is back — only 262MB available even at idle with Jenkins running, confirming the root cause: this server cannot build Go code while Jenkins is running*
+
+**The fix — upgrade Jenkins to t3.medium via Terraform:**
+
+The Jenkins instance type was changed from `t2.micro` (1GB RAM) to `t3.medium` (4GB RAM) in one line of Terraform:
+
+```hcl
+# variables.tf — before
+variable "jenkins_instance_type" {
+  default = "t2.micro"   ← 1GB RAM, no headroom for builds
+}
+
+# variables.tf — after
+variable "jenkins_instance_type" {
+  default = "t3.medium"  ← 4GB RAM, plenty for Jenkins + Docker builds
+}
+```
+
+![Terraform t3medium plan](docs/screenshots/85-terraform-t3medium-plan.png)
+*VS Code showing variables.tf with jenkins_instance_type changed to t3.medium — running terraform apply will stop Jenkins, resize it from t2.micro to t3.medium, and restart it; the Elastic IP stays the same so nothing else changes*
+
+![Jenkins t3medium confirmed](docs/screenshots/86-jenkins-t3medium-confirmed.png)
+*Jenkins is now on t3.medium (4GB RAM) — AWS console confirms the instance type change*
+
+This led directly to Incident 2.
+
+---
+
+### Incident 2 — Terraform Destroyed Both Servers (AMI Change)
+
+**What happened — in simple terms:**
+
+Imagine you ask a builder to renovate your kitchen. You say "use the latest tiles available." The builder goes to the shop and finds that the tiles you used when you first built the house are no longer the latest model — a new version was released last week. The builder decides the only way to put in the new tiles is to demolish the kitchen and rebuild it from scratch. You lose everything in the kitchen.
+
+That is exactly what Terraform did. Both servers were demolished and rebuilt from scratch.
+
+**The technical detail:**
+
+Our Terraform code used `most_recent = true` in the AMI data source — meaning "always use the latest Ubuntu image from AWS." Between when we first built the servers and now, AWS published a new Ubuntu AMI:
+
+```
+Old AMI: ami-0f7804991cb8f07c4   ← what our servers were running on
+New AMI: ami-0c905937c14bd22b0   ← what AWS published recently
+```
+
+Terraform detected the new AMI and determined it needed to replace both instances. In the plan output, this appeared as:
+
+```
+# module.ec2.aws_instance.jenkins must be replaced
+-/+ resource "aws_instance" "jenkins" {
+      ~ ami = "ami-0f7804991cb8f07c4" -> "ami-0c905937c14bd22b0" # forces replacement
+```
+
+![Jenkins must replace](docs/screenshots/89-jenkins-must-replace.png)
+*Terraform plan — `module.ec2.aws_instance.jenkins must be replaced` with -/+ symbol clearly visible*
+
+![Terraform forces replacement Jenkins](docs/screenshots/87-terraform-forces-replacement-jenkins.png)
+*Plan detail for Jenkins instance — `# forces replacement` next to the AMI change line*
+
+![Terraform forces replacement k3s](docs/screenshots/88-terraform-forces-replacement-k3s.png)
+*Plan detail for k3s instance — same AMI change forcing replacement on the second server too*
+
+The `-/+` symbol and `# forces replacement` were the warning signs. The plan was approved without fully reading it, and both servers were destroyed.
+
+![Apply 2 destroyed](docs/screenshots/90-apply-2-destroyed.png)
+*Apply complete — 2 added, 2 changed, 2 destroyed. Both servers are gone.*
+
+![New instances after destroy](docs/screenshots/91-new-instances-after-destroy.png)
+*AWS EC2 console — two fresh instances running after Terraform rebuilt them from scratch. All installed software is gone.*
+
+**The warning signs that should have stopped the apply:**
+
+| Symbol | Meaning | Action |
+|---|---|---|
+| `+` | Create new resource | Generally safe |
+| `~` | Update existing resource | Generally safe |
+| `-` | Destroy resource | Stop and read carefully |
+| `-/+` | Destroy then recreate | **Stop. Read everything. Ask why.** |
+
+**The fix — `lifecycle { ignore_changes = [ami] }`:**
+
+This tells Terraform: "even if a new AMI is published, do not recreate the instance because of it." AMI updates on running servers are handled through Ansible, not by destroying and rebuilding.
+
+```hcl
+resource "aws_instance" "jenkins" {
+  ami           = data.aws_ami.ubuntu.id
+  instance_type = var.jenkins_instance_type
+
+  lifecycle {
+    ignore_changes = [ami]   ← never destroy the server just because a new AMI exists
+  }
+}
+```
+
+![Lifecycle fix Jenkins](docs/screenshots/92-lifecycle-fix-jenkins.png)
+*`lifecycle { ignore_changes = [ami] }` added to the Jenkins instance in terraform/modules/ec2/main.tf — Terraform will never destroy this instance due to an AMI change again*
+
+![Lifecycle fix k3s](docs/screenshots/93-lifecycle-fix-k3s.png)
+*Same lifecycle fix applied to the k3s instance — both servers now protected from AMI-triggered replacement*
+
+This fix was applied to both the Jenkins and k3s instance resources immediately after the incident.
+
+---
+
+### Why This Incident is Valuable — Infrastructure as Code in Action
+
+**The silver lining:** Both servers were rebuilt and fully operational again within a few hours. Not because of luck — because every installation step was already written as Ansible playbooks.
+
+Without IaC, rebuilding would mean:
+- Remembering every package installed over weeks of work
+- Clicking through AWS consoles
+- Re-entering every configuration manually
+- Hours or days of work with no guarantee of matching the original
+
+With IaC, rebuilding means:
+```bash
+ansible-playbook setup-jenkins.yml   # Jenkins + Trivy + AWS CLI back in minutes
+ansible-playbook setup-k3s.yml       # k3s Kubernetes cluster back in minutes
+ansible-playbook setup-argocd.yml    # ArgoCD GitOps engine back in minutes
+kubectl apply -f kubernetes/argocd/  # Online Boutique redeployed from Git
+```
+
+Everything was back because everything was in code. The servers are disposable. The code is permanent.
+
+**This is exactly why Infrastructure as Code exists.** Not to prevent mistakes — mistakes happen. But to make recovery fast, consistent, and complete.
+
+---
+
+### Recovery Plan — Rebuilding After the Terraform Incident
+
+Both servers are fresh Ubuntu with only Docker installed (from the Terraform user_data script). Everything else needs to be reinstalled via Ansible playbooks.
+
+**Step 1 — Reinstall Jenkins (with Trivy and AWS CLI):**
+```bash
+ansible-playbook -i inventory/hosts playbooks/setup-jenkins.yml \
+  --private-key ~/.ssh/cloudcommerce-dev-key -u ubuntu
+```
+
+**Step 2 — Reconfigure Jenkins in the UI:**
+- Unlock with initial admin password
+- Install suggested plugins
+- Create admin account
+- Add credentials (aws-account-id, github-token)
+- Create cloudcommerce-frontend pipeline job
+- Re-enable GitHub webhook trigger
+
+**Step 3 — Reinstall k3s:**
+```bash
+ansible-playbook -i inventory/hosts playbooks/setup-k3s.yml \
+  --private-key ~/.ssh/cloudcommerce-dev-key -u ubuntu
+```
+
+**Step 4 — Reinstall ArgoCD:**
+```bash
+ansible-playbook -i inventory/hosts playbooks/setup-argocd.yml \
+  --private-key ~/.ssh/cloudcommerce-dev-key -u ubuntu
+```
+
+**Step 5 — Redeploy Online Boutique:**
+```bash
+kubectl apply -f kubernetes/argocd/online-boutique.yaml
+```
+ArgoCD detects the manifest and automatically syncs the Helm chart from GitHub. The application is back within minutes.
+
+**Step 6 — Retry the Jenkins pipeline build:**
+
+Push any change to `microservices-demo` to trigger the webhook. This time Jenkins has 4GB RAM — the Go compilation completes without OOM.
+
+---
+
+### Progress
+- [x] Jenkins pipeline job created — cloudcommerce-frontend pointing at microservices-demo
+- [x] GitHub webhook configured — push to microservices-demo triggers Jenkins instantly
+- [x] OOM crash diagnosed — Jenkins server ran out of memory during Go compilation
+- [x] Terraform AMI incident — both servers accidentally destroyed and recreated, lifecycle fix applied
+- [ ] Rebuild Jenkins and k3s via Ansible playbooks
+- [ ] Reconfigure Jenkins — plugins, credentials, pipeline job
+- [ ] Redeploy Online Boutique via ArgoCD
+- [ ] Run first successful full pipeline build
 
 ---
 
