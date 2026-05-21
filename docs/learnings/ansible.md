@@ -216,6 +216,159 @@ chmod 600 ~/.ssh/cloudcommerce-dev-key
 
 SSH refuses to use private keys that are readable by other users (`chmod 644` or looser). This is a hard security requirement — not a warning.
 
+## Modules vs Shell — When to Use Each
+
+This is one of the most important Ansible concepts to understand.
+
+**Built-in modules** are Ansible's preferred way to run tasks. Ansible fully controls them:
+- Knows exactly what state was before and after
+- Reports `ok` vs `changed` accurately
+- Handles errors cleanly
+- Are idempotent by design
+
+```yaml
+- name: Install packages         ← Ansible module
+  apt:
+    name: jenkins
+    state: present               # Ansible checks, installs only if missing, fails if it can't
+
+- name: Start service            ← Ansible module
+  systemd:
+    name: jenkins
+    state: started               # Ansible checks service state before acting
+```
+
+**The `shell` module** hands Ansible a bash script and says "run this." Ansible only sees the final exit code — it has no visibility into what happened inside:
+
+```yaml
+- name: Install AWS CLI          ← shell task
+  shell: |
+    curl ...      # Ansible doesn't know if this worked
+    unzip ...     # Ansible doesn't know if this worked
+    ./install     # Ansible doesn't know if this worked
+    rm -rf ...    # this always works — exit code 0
+                  # Ansible sees 0 → reports "changed" ✓ (even if curl failed)
+```
+
+**Rule:** Use built-in modules wherever one exists. Use `shell` only when no module covers what you need. There are over 3,000 Ansible modules — always check first.
+
+## The Silent Failure Problem with Shell Tasks
+
+The AWS CLI installation in this project exposed a critical shell task pitfall.
+
+The install script requires `unzip` to extract the downloaded zip file. `unzip` was not installed. The extraction step failed silently — but the final `rm -rf` always succeeds (exit 0), so Ansible reported `changed` (success). The binary was never created.
+
+This was only caught by SSHing into the server and running `aws --version` — which returned command not found despite Ansible claiming success.
+
+**The three fixes:**
+
+**1 — Install dependencies first:**
+```yaml
+- name: Install Java 21 and dependencies
+  apt:
+    name:
+      - openjdk-21-jdk
+      - curl
+      - gnupg
+      - unzip          ← added: required by AWS CLI install script
+```
+
+**2 — Add `set -e` to shell scripts:**
+```yaml
+- name: Install AWS CLI
+  shell: |
+    set -e             ← if ANY command fails, stop immediately
+    curl "..." -o /tmp/awscliv2.zip
+    unzip ...          ← now fails loudly if unzip missing
+    /tmp/aws/install
+    rm -rf ...
+```
+
+`set -e` is bash's "stop on error" flag. Without it, bash continues executing after a failed command. With it, the first failure stops the script and returns a non-zero exit code — which Ansible correctly marks as `failed`.
+
+**3 — Clean up before retrying:**
+```yaml
+- name: Clean up any partial AWS CLI install
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /tmp/awscliv2.zip
+    - /tmp/aws
+```
+
+A failed install may leave partial files. Without cleanup, the `creates: /usr/local/bin/aws` check would see the zip still present and behave unpredictably. The `file` module with `state: absent` is idempotent — it removes the files if they exist, does nothing if they don't.
+
+## failed_when and changed_when — Controlling Task Outcomes
+
+Two important task-level controls:
+
+**`changed_when: false`** — tell Ansible this task never makes changes, even if it runs:
+```yaml
+- name: Get Jenkins initial admin password
+  command: cat /var/lib/jenkins/secrets/initialAdminPassword
+  register: jenkins_password
+  changed_when: false     ← reading a file changes nothing, don't mark as changed
+```
+
+Without this, every read-only operation would show as `changed` — misleading in the PLAY RECAP.
+
+**`failed_when: false`** — tell Ansible never to fail this task, regardless of exit code:
+```yaml
+- name: Get Jenkins initial admin password
+  command: cat /var/lib/jenkins/secrets/initialAdminPassword
+  register: jenkins_password
+  changed_when: false
+  failed_when: false      ← file not found (rc=1) is acceptable after first setup
+```
+
+The initial admin password file only exists on first-time Jenkins setup. Once you've created an admin account it's deleted. Without `failed_when: false`, every subsequent playbook run would crash at this task with "No such file or directory".
+
+`failed_when` accepts conditions:
+```yaml
+failed_when: result.rc != 0 and 'already exists' not in result.stderr
+# fail only if the return code is non-zero AND the error is not "already exists"
+```
+
+## Memory Constraints on t2.micro
+
+The Jenkins EC2 instance is a t2.micro with 1GB RAM and no swap. Jenkins JVM consumes ~600MB leaving only ~100MB available at runtime.
+
+Running system maintenance (apt installs, large downloads) while Jenkins is running causes operations to fail or hang — there is simply not enough memory for new processes to start.
+
+**The pattern for any system maintenance on the Jenkins server:**
+```bash
+sudo systemctl stop jenkins    # free ~400-500MB
+# run maintenance (Ansible playbook, manual installs, etc.)
+sudo systemctl start jenkins   # or the playbook starts it automatically
+```
+
+This is not a flaw — it's an expected operational pattern for memory-constrained servers. In a production environment, a larger instance type would be used. For this portfolio project, the t2.micro constraint is understood and managed.
+
+**Why no swap?** The EC2 instance was provisioned without a swap file. Adding swap would give the OS breathing room when RAM is under pressure. This is a future improvement — for now, stopping Jenkins before maintenance is the established pattern.
+
+## SSH Key Permissions — 600 vs 777
+
+SSH private keys must have permissions `600` (readable only by the owner):
+
+```bash
+chmod 600 ~/.ssh/cloudcommerce-dev-key
+```
+
+Files on the Windows filesystem mounted in WSL (`/mnt/c/...`) appear with permissions `777` — readable by everyone — because Windows doesn't have the same permission model as Linux. SSH refuses to use any private key that is world-readable:
+
+```
+WARNING: UNPROTECTED PRIVATE KEY FILE!
+Permissions 0777 for '/mnt/c/...cloudcommerce-dev-key' are too open.
+```
+
+**The fix:** Always use the key from the WSL home directory (`~/.ssh/`), not from the Windows path. The key was copied there during initial setup with the correct permissions:
+
+```bash
+cp /mnt/c/Users/OnlyM/.../cloudcommerce-dev-key ~/.ssh/
+chmod 600 ~/.ssh/cloudcommerce-dev-key
+```
+
 ## Interview Talking Points
 
 - "I use Ansible for server configuration because it's agentless — there's nothing to install or maintain on target servers, which reduces attack surface and operational overhead"
@@ -223,3 +376,6 @@ SSH refuses to use private keys that are readable by other users (`chmod 644` or
 - "I ran Ansible from WSL because it doesn't support Windows natively — the world-writable filesystem restriction required passing all config explicitly on the command line rather than relying on ansible.cfg auto-loading"
 - "I use the `creates` argument on shell tasks to make them idempotent — the task is skipped if the target file already exists"
 - "I always test connectivity with `ansible all -m ping` before running playbooks — this catches SSH or inventory issues before a long playbook run fails partway through"
+- "I learned the hard way that `changed` in Ansible means the task ran — not that it succeeded. A shell task whose last command exits 0 will report changed even if every meaningful step before it failed. I now add `set -e` to all multi-step shell scripts"
+- "I use `failed_when: false` on tasks that may legitimately return a non-zero exit code — like reading the Jenkins initial admin password file, which only exists on first setup"
+- "On a t2.micro with 1GB RAM, Jenkins holds ~600MB. Any system maintenance must be done with Jenkins stopped — otherwise apt cannot allocate the memory it needs to install packages"

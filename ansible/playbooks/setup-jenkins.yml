@@ -16,6 +16,7 @@
           - openjdk-21-jdk
           - curl
           - gnupg
+          - unzip
         state: present
         update_cache: yes
 
@@ -63,8 +64,17 @@
       args:
         creates: /usr/local/bin/trivy
 
+    - name: Clean up any partial AWS CLI install
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/awscliv2.zip
+        - /tmp/aws
+
     - name: Install AWS CLI
       shell: |
+        set -e
         curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
         unzip -q /tmp/awscliv2.zip -d /tmp
         /tmp/aws/install
@@ -82,7 +92,8 @@
       command: cat /var/lib/jenkins/secrets/initialAdminPassword
       register: jenkins_password
       changed_when: false
+      failed_when: false
 
     - name: Print Jenkins initial admin password
       debug:
-        msg: "Jenkins initial admin password: {{ jenkins_password.stdout }}"
+        msg: "Jenkins initial admin password: {{ jenkins_password.stdout | default('already configured - file no longer exists') }}"

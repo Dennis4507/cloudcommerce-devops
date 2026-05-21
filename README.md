@@ -1282,7 +1282,190 @@ Google's CI workflows (`.github/workflows/`) were removed — Jenkins replaces t
 - [x] Online Boutique fully functional — products, cart, and checkout all working
 - [x] Jenkins credentials configured — GitHub token and AWS account ID secured
 - [x] Application repo created — Dennis4507/microservices-demo owns the application source
-- [ ] Install Trivy and AWS CLI on Jenkins server via Ansible
+- [x] Install Trivy and AWS CLI on Jenkins server via Ansible — two bugs diagnosed and fixed
+- [ ] Create Jenkins pipeline job pointing at microservices-demo
+- [ ] Configure GitHub webhook → Jenkins trigger
+- [ ] Run first full pipeline build → ECR → values.yaml update → ArgoCD deploy
+
+---
+
+### Installing Trivy and AWS CLI — Session Management and Silent Failures
+
+With the Online Boutique live and credentials configured, the final step before running the Jenkins pipeline was installing two tools on the Jenkins server: Trivy (image scanner) and AWS CLI (ECR authentication). This exposed two separate problems that required diagnosis and playbook fixes.
+
+#### Stop/Start Discipline — EC2 Instance Management
+
+Instances are stopped between working sessions and started again when needed. This keeps running costs near zero — AWS charges nothing for stopped EC2 instances — while Elastic IPs ensure the addresses never change.
+
+![Stop instances](docs/screenshots/61-stop-instances.png)
+*Instances stopped at end of session — "Successfully initiated stopping" confirmation in AWS console*
+
+![Instances stopped](docs/screenshots/62-instances-stopped.png)
+*AWS console filtered by instance state = stopped — both Jenkins and k3s instances off*
+
+At the start of the next session, both instances are started together:
+
+![Start instances](docs/screenshots/63-start-instances.png)
+*Both instances successfully started — AWS console showing running state restored*
+
+---
+
+#### Challenge 1 — Ansible Playbook Stuck: t2.micro Memory Constraint
+
+The Ansible playbook ran but hung at "Install Java 21 and dependencies" — the terminal showed no progress for minutes. SSHing into the server and running `free -h` revealed the cause:
+
+```
+Mem:   957Mi   697Mi   70Mi   0.0Ki   188Mi   100Mi
+Swap:     0B     0B    0B
+```
+
+Only 100MB available, no swap. Jenkins JVM was holding ~600MB of the 1GB total. With so little free memory, apt could not spawn the processes needed to install packages — even `java --version` hung when run interactively.
+
+**Fix:** Stop Jenkins first to free ~400MB, then run the playbook:
+
+```bash
+sudo systemctl stop jenkins
+```
+
+![Stop Jenkins to free memory](docs/screenshots/64-stop-jenkins-free-memory.png)
+*Jenkins stopped — free -h shows 573MB available, plenty of headroom for apt to work*
+
+This is a known constraint of the t2.micro (1GB RAM). Jenkins is fine for running pipelines, but system maintenance must be done with Jenkins stopped. The pattern: stop Jenkins → run Ansible → Jenkins restarts automatically at the end of the playbook.
+
+---
+
+#### Challenge 2 — Ansible Reported Success but AWS CLI Was Not Installed
+
+With Jenkins stopped, the playbook ran and reported `changed=4, failed=1`. The failure was the initial admin password task — but more importantly, even though "Install AWS CLI" showed `changed` (meaning Ansible believed it succeeded), running `aws --version` on the server returned command not found.
+
+![Ansible password task failed](docs/screenshots/65-ansible-password-task-failed.png)
+*Ansible output — ok=12, changed=4, failed=1. AWS CLI shows changed but the binary does not exist*
+
+This is a silent failure — Ansible reported success for a task that did not actually complete. The root cause: the AWS CLI install script requires `unzip` to extract the downloaded zip file, but `unzip` was not installed on the server.
+
+```bash
+curl ...           # downloads the zip — succeeds
+unzip ...          # FAILS — unzip not installed
+/tmp/aws/install   # never runs
+rm -rf ...         # always succeeds — exit code 0
+```
+
+Because bash only checks the exit code of the **last command**, and `rm -rf` always exits 0, Ansible saw success. The actual failure was invisible.
+
+![AWS CLI unzip bug](docs/screenshots/67-awscli-unzip-bug.png)
+*Old playbook — unzip missing from dependencies, AWS CLI install silently fails at extraction step*
+
+---
+
+#### Fix 1 — Playbook Crash on Missing Password File
+
+The separate `failed=1` was the "Get Jenkins initial admin password" task trying to read a file that only exists on first-time Jenkins setup. Since Jenkins was already configured, the file was long gone. The fix — `failed_when: false` — tells Ansible not to crash when the file is absent:
+
+```yaml
+- name: Get Jenkins initial admin password
+  command: cat /var/lib/jenkins/secrets/initialAdminPassword
+  register: jenkins_password
+  changed_when: false
+  failed_when: false    ← file not found is acceptable after first setup
+```
+
+![failed_when false fix](docs/screenshots/66-failed-when-false-fix.png)
+*VS Code diff — failed_when: false added, default message updated to explain the missing file*
+
+---
+
+#### Fix 2 — AWS CLI Silent Failure
+
+Three changes to the playbook fixed the silent AWS CLI failure:
+
+**1 — Add `unzip` to dependencies** so it is always present before the install script runs:
+
+```yaml
+- name: Install Java 21 and dependencies
+  apt:
+    name:
+      - openjdk-21-jdk
+      - curl
+      - gnupg
+      - unzip          ← added
+```
+
+**2 — Add `set -e`** to the shell script so any step failure stops the script immediately and Ansible reports a real error:
+
+```yaml
+- name: Install AWS CLI
+  shell: |
+    set -e             ← stops on any failure, no more silent passes
+    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+    unzip -q /tmp/awscliv2.zip -d /tmp
+    /tmp/aws/install
+    rm -rf /tmp/awscliv2.zip /tmp/aws
+```
+
+**3 — Add a cleanup task** to remove any leftover files from the previous failed attempt before retrying:
+
+```yaml
+- name: Clean up any partial AWS CLI install
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /tmp/awscliv2.zip
+    - /tmp/aws
+```
+
+![AWS CLI unzip fix explained](docs/screenshots/68-awscli-unzip-fix.png)
+*New playbook — unzip added to dependencies, cleanup task added before install*
+
+![AWS CLI set -e fix](docs/screenshots/69-awscli-set-e-fix.png)
+*set -e and cleanup task in context — any step failure now surfaces immediately*
+
+![Playbook AWS CLI updated in VS Code](docs/screenshots/70-playbook-awscli-updated.png)
+*setup-jenkins.yml in VS Code — updated Install AWS CLI task with set -e and correct unzip*
+
+![Playbook failed_when false in VS Code](docs/screenshots/71-playbook-failed-when-false.png)
+*setup-jenkins.yml in VS Code — failed_when: false on password task and default message*
+
+---
+
+#### Final Playbook Run — Full Success
+
+With both fixes applied, the playbook ran cleanly: 15 tasks, 4 changed, 0 failed:
+
+![Ansible Jenkins full success](docs/screenshots/72-ansible-jenkins-full-success.png)
+*Full successful run — ok=15, changed=4, failed=0. AWS CLI installed, Trivy confirmed, Jenkins started*
+
+AWS CLI verified on the server:
+
+![AWS CLI verified](docs/screenshots/73-aws-cli-verified.png)
+*aws --version confirms aws-cli/2.34.51 installed and available — Jenkins is now ready to authenticate to ECR*
+
+**What this teaches:**
+
+- `changed` in Ansible means the task ran — it does not guarantee the task did what you intended. Always verify the actual outcome on the server
+- `shell` tasks only see the exit code of the last command. Add `set -e` to any multi-step shell script so failures surface immediately
+- Use Ansible's built-in modules (`apt`, `systemd`, `file`) wherever possible — they handle error detection and idempotency automatically. Use `shell` only when no module exists, and always add `set -e`
+- On memory-constrained servers (t2.micro, 1GB RAM), stop memory-hungry services before running system maintenance. Jenkins JVM holds ~600MB — leaving no room for apt to operate
+
+---
+
+### Progress
+- [x] k3s installed via Ansible — single-binary Kubernetes on EC2 t3.medium
+- [x] TLS SAN challenge diagnosed and resolved — public Elastic IP added to certificate via `--tls-san`
+- [x] kubectl installed and configured — remote cluster access from local machine confirmed
+- [x] k9s v0.50.18 installed — terminal UI showing all 7 system pods Running
+- [x] kubectl PATH made permanent on Windows — works across all terminal sessions
+- [x] ArgoCD installed via Ansible — two kubectl apply challenges diagnosed and resolved
+- [x] ArgoCD UI accessible at https://63.184.235.88:30080 — GitOps engine live
+- [x] Online Boutique Helm chart copied into repo — chart validated with helm lint
+- [x] ArgoCD Application manifest created and applied — all 12 services deployed
+- [x] Traefik Ingress configured — 404 resolved, site live at http://63.184.235.88
+- [x] Online Boutique fully functional — products, cart, and checkout all working
+- [x] Jenkins credentials configured — GitHub token and AWS account ID secured
+- [x] Application repo created — Dennis4507/microservices-demo owns the application source
+- [x] Trivy installed on Jenkins server — image scanning ready
+- [x] AWS CLI installed on Jenkins server — ECR authentication ready
+- [x] t2.micro memory constraint understood — stop Jenkins before system maintenance
 - [ ] Create Jenkins pipeline job pointing at microservices-demo
 - [ ] Configure GitHub webhook → Jenkins trigger
 - [ ] Run first full pipeline build → ECR → values.yaml update → ArgoCD deploy
