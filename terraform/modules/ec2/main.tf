@@ -30,6 +30,10 @@ resource "aws_instance" "jenkins" {
   iam_instance_profile   = var.jenkins_iam_profile
   vpc_security_group_ids = [aws_security_group.jenkins.id]
 
+  lifecycle {
+    ignore_changes = [ami]
+  }
+
   root_block_device {
     volume_size = 20
     volume_type = "gp3"
@@ -111,6 +115,10 @@ resource "aws_instance" "k3s" {
   key_name               = aws_key_pair.main.key_name
   iam_instance_profile   = var.k3s_iam_profile
   vpc_security_group_ids = [aws_security_group.k3s.id]
+
+  lifecycle {
+    ignore_changes = [ami]
+  }
 
   root_block_device {
     volume_size = 30
