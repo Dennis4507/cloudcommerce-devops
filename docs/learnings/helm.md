@@ -26,68 +26,113 @@ online-boutique/
 
 One chart. One `values.yaml`. Helm fills in the variables and produces plain Kubernetes YAML.
 
+## Three Files, Three Jobs
+
+Every Helm chart has exactly three parts. Each one has one job and they only work when read together.
+
+```
+Chart.yaml    → the ID card        (what this chart is called and what version it is)
+values.yaml   → the order form     (all the settings — image tags, CPU, memory, toggles)
+templates/    → the blank forms    (the Kubernetes instructions with gaps to fill in)
+```
+
+Think of it like a pizza restaurant:
+- Chart.yaml is the label on the box — it just says what it is
+- values.yaml is the filled-in order form — every setting written down
+- templates are the blank order forms — gaps filled in from values.yaml at deploy time
+
 ## Helm Chart Structure
 
-### Chart.yaml
-
-Metadata about the chart — name, version, description:
+### Chart.yaml — The ID Card
 
 ```yaml
 apiVersion: v2
 name: onlineboutique
 description: A Helm chart for Kubernetes for Online Boutique
-type: application
+type: application      # "application" = deployable. "library" = helper only, cannot deploy
 version: 0.10.5        # chart version — increment when chart structure changes
 appVersion: "v0.10.5"  # application version being deployed
 ```
 
+`type: application` simply means this chart can be deployed directly. The alternative `library` charts are only helper utilities that other charts use — they cannot be deployed on their own.
+
 `version` and `appVersion` are separate:
-- `version` — the version of the Helm chart itself (the packaging)
+- `version` — the version of the Helm chart itself (the packaging and templates)
 - `appVersion` — the version of the application the chart deploys
 
-### values.yaml
+When `values.yaml` has an empty image tag (`tag: ""`), Helm falls back to `appVersion` as the default. Jenkins overrides this by writing the Git commit SHA, making `appVersion` irrelevant for our pipeline.
 
-The configuration file. Every `{{ .Values.something }}` in a template is filled from here:
+### values.yaml — The Settings File
+
+values.yaml controls far more than just image tags. It is the single file that controls everything about how the entire application runs:
 
 ```yaml
 images:
   repository: us-central1-docker.pkg.dev/google-samples/microservices-demo
-  tag: ""              # empty = use appVersion from Chart.yaml
+  tag: ""              # empty = fall back to appVersion from Chart.yaml
 
 frontend:
-  create: true
+  create: true         # toggle — set false to completely skip deploying this service
   name: frontend
-  replicas: 1
   resources:
     requests:
-      cpu: 100m
-      memory: 64Mi
+      cpu: 100m        # minimum CPU guaranteed to this service
+      memory: 64Mi     # minimum memory guaranteed to this service
+    limits:
+      cpu: 200m        # maximum CPU this service is allowed to use
+      memory: 128Mi    # maximum memory it is allowed to use
+
+cartService:
+  create: true
+  name: cartservice
+  resources:
+    requests:
+      cpu: 200m
+      memory: 128Mi
+    limits:
+      cpu: 300m
+      memory: 256Mi
 ```
 
-This is the file Jenkins writes to after every build:
+Every one of the 12 services has its own section. This means you can:
+- Turn a service on or off with one line (`create: true/false`)
+- Give different services different amounts of CPU and memory
+- Change any setting without touching the templates at all
+
+**The ECR migration — a current TODO in this project:**
+
+values.yaml currently points at Google's public image registry:
 ```yaml
 images:
-  repository: 123456789.dkr.ecr.eu-central-1.amazonaws.com/cloudcommerce
-  tag: "abc123f"       # ← Jenkins writes the new git commit sha here
+  repository: us-central1-docker.pkg.dev/google-samples/microservices-demo
 ```
 
-### templates/
+Once Jenkins is building and pushing images to our ECR, this line needs to change to:
+```yaml
+images:
+  repository: <your-account-id>.dkr.ecr.eu-central-1.amazonaws.com/cloudcommerce
+  tag: "3f8a92c"   # ← Jenkins writes the Git commit SHA here after every build
+```
 
-Kubernetes manifests with `{{ }}` placeholders filled from `values.yaml`:
+Until this change is made, the cluster is pulling Google's public images rather than our own built images. This is the final wiring step that connects Jenkins's output to ArgoCD's input.
+
+### templates/ — The Blank Forms
+
+Kubernetes manifests with `{{ }}` placeholders filled from `values.yaml` at deploy time:
 
 ```yaml
-# templates/frontend.yaml
-spec:
-  containers:
-  - name: server
-    image: {{ .Values.images.repository }}/frontend:{{ .Values.images.tag | default .Chart.AppVersion }}
-    resources:
-      requests:
-        cpu: {{ .Values.frontend.resources.requests.cpu }}
-        memory: {{ .Values.frontend.resources.requests.memory }}
+# templates/frontend.yaml — the actual line from our chart
+image: {{ .Values.images.repository }}/{{ .Values.frontend.name }}:{{ .Values.images.tag | default .Chart.AppVersion }}
 ```
 
-Helm renders this at deploy time by substituting values — the cluster receives plain Kubernetes YAML with all variables resolved.
+In plain English: `[repository from values.yaml] / [service name from values.yaml] : [tag from values.yaml]`
+
+When rendered with our values this becomes:
+```
+image: <account-id>.dkr.ecr.eu-central-1.amazonaws.com/cloudcommerce/frontend:3f8a92c
+```
+
+The templates also pull CPU limits, memory limits, port numbers, environment variables, and service connections — all from values.yaml. The templates themselves rarely change. values.yaml is where all configuration decisions live.
 
 ## Helm Template Syntax
 

@@ -104,6 +104,29 @@ spec:
 | **Degraded** | Resources are present but unhealthy (CrashLoopBackOff, etc.) |
 | **Missing** | Resources defined in Git don't exist in the cluster at all |
 
+## How ArgoCD Connects to GitHub — Credentials
+
+When you register a repository inside ArgoCD, you provide a credential — either a GitHub PAT or an SSH key. This gives ArgoCD access to read the repository.
+
+**This credential is read-only.** ArgoCD never writes to GitHub. Its entire job is to read the repository and deploy what it finds. This is intentional and important:
+
+```
+Jenkins PAT    → write access  → Jenkins needs to UPDATE values.yaml on GitHub
+ArgoCD PAT     → read access   → ArgoCD only needs to READ values.yaml from GitHub
+```
+
+These are two completely separate credentials stored in two different places. If ArgoCD's credential were ever compromised, an attacker could only read the repository — they could not change anything.
+
+**What ArgoCD watches — the whole folder, not just values.yaml:**
+
+ArgoCD is pointed at a folder path, not a specific file:
+```yaml
+source:
+  path: kubernetes/apps/online-boutique   # ← watches this entire folder
+```
+
+It watches every file in that folder. If Chart.yaml, values.yaml, or any template file changes, ArgoCD detects it and syncs. In practice the only file Jenkins ever changes is values.yaml — so that is almost always what triggers ArgoCD. But technically any change to anything in that folder would trigger a sync.
+
 ## ArgoCD and Helm
 
 ArgoCD has Helm built-in. When a path contains a `Chart.yaml`, ArgoCD automatically detects it as a Helm chart and:

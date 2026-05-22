@@ -1873,12 +1873,294 @@ After creating an admin account, Jenkins is fully operational and ready for the 
 - [x] Terraform AMI incident — both servers accidentally destroyed and recreated, lifecycle fix applied
 - [x] Jenkins reinstalled via Ansible — GPG key mismatch resolved after 4 failed attempts
 - [x] Jenkins UI configured — suggested plugins, Docker Pipeline, admin account created
-- [ ] Add Jenkins credentials — GitHub token and AWS account ID
-- [ ] Recreate cloudcommerce-frontend pipeline job
+- [x] Add Jenkins credentials — GitHub token and AWS account ID
+- [x] Recreate cloudcommerce-frontend pipeline job
+- [x] Root cause diagnosed — Jenkins was actually running on t2.micro, not t3.medium
+- [x] Instance resized to t3.medium — first successful pipeline build completed
 - [ ] Rebuild k3s via Ansible playbook
 - [ ] Reinstall ArgoCD
 - [ ] Redeploy Online Boutique via ArgoCD
-- [ ] Run first successful full pipeline build
+- [ ] Run first full end-to-end pipeline → ECR → ArgoCD → k3s deploy
+
+---
+
+### Jenkins Credentials — Restored After Reinstallation
+
+With Jenkins reinstalled and configured, both pipeline credentials were added to the Jenkins credential store under **Global** scope (not System scope — System scope limits credentials to Jenkins internals only, Global makes them available to pipeline jobs):
+
+**1 — AWS Account ID** (`aws-account-id`) — Secret Text. Used to construct the ECR registry URL:
+```
+<account-id>.dkr.ecr.eu-central-1.amazonaws.com/cloudcommerce/frontend
+```
+
+**2 — GitHub Personal Access Token** (`github-token`) — Username with Password. Jenkins uses this to clone `cloudcommerce-devops` and push the updated `values.yaml` back to GitHub after every build.
+
+![Jenkins credentials configured](docs/screenshots/04_jenkins_credentials.png)
+*Globale Zugangsdaten — both credentials in place: github-token and aws-account-id under Global scope. Jenkins authenticates to ECR via IAM role — no AWS keys stored anywhere.*
+
+---
+
+### Recreating the cloudcommerce-frontend Pipeline Job
+
+The pipeline job was recreated pointing at `microservices-demo`:
+
+- **Type:** Pipeline
+- **Trigger:** GitHub hook trigger for GITScm polling — Jenkins listens for webhook events from GitHub
+- **Definition:** Pipeline script from SCM — Jenkins reads the Jenkinsfile directly from the repository on every build
+- **Repository:** `https://github.com/Dennis4507/microservices-demo.git`
+- **Branch:** `*/main`
+
+![Jenkins pipeline from SCM](docs/screenshots/05_jenkins_pipeline_from_scm.png)
+*Pipeline configuration — "Pipeline script from SCM" selected. The Jenkinsfile lives in the same repository as the application code. Pipeline changes are reviewed alongside code changes, version controlled, and always match the code being built.*
+
+![Pipeline job created](docs/screenshots/06_pipeline_job_created.png)
+*cloudcommerce-frontend pipeline job created — ready to receive GitHub webhook events*
+
+The GitHub webhook was recreated on `microservices-demo`:
+
+![GitHub webhook created](docs/screenshots/07_github_webhook_created.png)
+*GitHub webhook — Payload URL: `http://3.127.90.169:8080/github-webhook/`, push events only. Every git push immediately triggers a Jenkins build with no polling delay.*
+
+![Microservices demo Jenkinsfile](docs/screenshots/08_microservices_demo_jenkinsfile.png)
+*Jenkinsfile in Dennis4507/microservices-demo — defines all 5 pipeline stages: Checkout, Build Image, Scan with Trivy, Push to ECR, Update values.yaml*
+
+---
+
+### Build #1 — Triggered, Then Server Became Unresponsive
+
+A small test change was committed and pushed to `microservices-demo` to trigger the first build:
+
+```html
+<!-- CloudCommerce pipeline test v1 -->
+```
+
+Jenkins received the webhook and build #1 started within seconds:
+
+![Pipeline triggered](docs/screenshots/09_pipeline_triggered.png)
+*Build #1 triggered by GitHub push — webhook working, Jenkinsfile read from repository*
+
+![Pipeline build running](docs/screenshots/10_pipeline_build_running.png)
+*Build #1 in progress — Stage: Build Image, Docker pulling base images and compiling the Go frontend*
+
+![Pipeline running build image stage](docs/screenshots/11_pipeline_running_build_image.png)
+*6 minutes in — normal for a first build with no Docker layer cache*
+
+After 6 hours, the Jenkins UI became completely unreachable — `ERR_CONNECTION_TIMED_OUT`. The build had been running the entire time.
+
+![Server down after crash](docs/screenshots/12_server_down_crash.png)
+*Jenkins UI unreachable — ERR_CONNECTION_TIMED_OUT after 6 hours. The server had become unresponsive under sustained build load.*
+
+The instance was rebooted from the AWS console:
+
+![Stop start explanation](docs/screenshots/13_stop_start_explanation.png)
+*Stop → Start chosen over Reboot — forces AWS to provision on fresh underlying hardware and fully clears RAM*
+
+![Instance starting](docs/screenshots/14_instance_starting.png)
+*Jenkins instance restarting after Stop → Start*
+
+![Instance back live](docs/screenshots/15_instance_back_live.png)
+*Jenkins instance Running — back online*
+
+Reconnecting over SSH required clearing the old host key (Stop → Start changes physical hardware):
+
+![SSH host key changed error](docs/screenshots/16_ssh_host_key_changed_error.png)
+*SSH blocked — REMOTE HOST IDENTIFICATION HAS CHANGED. Expected after Stop → Start*
+
+![Known hosts cleared](docs/screenshots/17_known_hosts_cleared.png)
+*ssh-keygen -R clears the old fingerprint — SSH connects cleanly on the next attempt*
+
+![Jenkins service running](docs/screenshots/18_jenkins_service_running.png)
+*sudo systemctl status jenkins — active (running). Jenkins came back automatically after reboot.*
+
+The build console showed the cause:
+
+![Pipeline failure console](docs/screenshots/20_pipeline_failure_console.png)
+*Console end — `ERROR: script returned exit code -1`, `Finished: FAILURE`*
+
+![Jenkins lost connection exit minus 1](docs/screenshots/21_jenkins_lost_connection_exit_minus1.png)
+*Exit code -1 is not a build logic failure — it means Jenkins lost connection to the running Docker process when the server restarted mid-build. The Go compilation was still running when Jenkins went down.*
+
+---
+
+### Challenge: Second Build Attempt — Still Throttled
+
+A second build was triggered, this time to use the Docker layer cache from build #1:
+
+![Rebuild attempt before restructure](docs/screenshots/22_rebuild_attempt_before_restructure.png)
+*Decision — attempt a second build before restructuring the architecture, to validate pipeline logic first*
+
+The browser became sluggish almost immediately — the same pattern as before:
+
+![Browser sluggish CPU throttled](docs/screenshots/23_browser_sluggish_cpu_throttled.png)
+*Browser struggling to load Jenkins UI — CPU credits draining under Docker build load*
+
+SSH was used to tail the build log directly from disk, bypassing the browser entirely:
+
+```bash
+sudo tail -f /var/lib/jenkins/jobs/cloudcommerce-frontend/builds/2/log
+```
+
+The build was stuck at the same Go compilation step. Running `top` from SSH:
+
+![SSH top CPU throttled](docs/screenshots/24_ssh_top_cpu_throttled.png)
+*top — load average: 17.14 on a 2-core machine. 69.6% wa (disk I/O wait). The server is completely saturated.*
+
+---
+
+### Root Cause Discovered: Jenkins Was Running on t2.micro, Not t3.medium
+
+The `top` output contained the answer:
+
+```
+MiB Mem: 957.2 total
+```
+
+t3.medium has 4096MB RAM. **957MB is a t2.micro (1GB).** Despite all previous work assuming t3.medium, the `terraform.tfvars` confirmed what was actually provisioned:
+
+```hcl
+jenkins_instance_type = "t2.micro"
+```
+
+![Top reveals t2 micro](docs/screenshots/25_top_reveals_t2_micro.png)
+*top — MiB Mem: 957.2 total. This is 1GB RAM (t2.micro), not 4GB (t3.medium). Every Jenkins crash, throttle, and failed build traced back to this single misconfiguration.*
+
+Every failure throughout Phase 2 had the same root cause: **a 1GB server running Jenkins JVM (~600MB) + Docker build (~400-500MB) = 1100MB needed, 957MB available.** The Go compiler was always killed or throttled before it could finish.
+
+---
+
+### Fix: Instance Resize Directly from AWS Console
+
+Rather than running `terraform apply` — which could trigger another AMI-related instance replacement (Incident 2) — the instance type was changed directly in the AWS Console:
+
+1. EC2 → Instances → Jenkins → Instance State → **Stop** (instance must be fully stopped for the option to appear)
+2. Actions → Instance Settings → **Change Instance Type** → `t3.medium`
+3. Instance State → **Start**
+
+The `terraform.tfvars` was updated in the local codebase to keep IaC in sync — but no `terraform apply` was run.
+
+![Change instance type console](docs/screenshots/26_change_instance_type_console.png)
+*AWS console — Change Instance Type. The option only appears on a fully stopped instance.*
+
+![Instance type changed t3 medium](docs/screenshots/27_instance_type_changed_t3_medium.png)
+*Instance type changed to t3.medium — 4GB RAM, confirmed in the AWS console*
+
+![Jenkins t3 medium starting](docs/screenshots/28_jenkins_t3_medium_starting.png)
+*Instance starting after resize — Successfully initiated starting*
+
+SSH known hosts cleared again (new hardware after resize), then connected:
+
+![SSH t3 medium connected](docs/screenshots/29_ssh_t3_medium_connected.png)
+*SSH to new t3.medium — System information shows Memory usage: 17%. 4GB RAM, only 17% used at idle. Compare to 86% on t2.micro.*
+
+![Jenkins login rebuild](docs/screenshots/30_jenkins_login_rebuild.png)
+*Jenkins UI loads instantly — no sluggishness. The browser response difference between t2.micro and t3.medium is immediate.*
+
+| Instance | Total RAM | Jenkins JVM | Available for build | Result |
+|---|---|---|---|---|
+| t2.micro | 957MB | ~600MB | ~357MB | OOM / CPU throttle / crash |
+| t3.medium | 4096MB | ~600MB | ~3400MB | Build completes cleanly |
+
+---
+
+### First Successful Pipeline Build — All 5 Stages Passed
+
+Build #3 was triggered from the Jenkins UI. With 4GB RAM, all 5 stages completed for the first time:
+
+![All 5 stages passed](docs/screenshots/31_all_5_stages_passed.png)
+*ALL 5 STAGES PASSED — first successful end-to-end CI pipeline run*
+
+![Pipeline successful overview](docs/screenshots/32_pipeline_successful_overview.png)
+*Finished: SUCCESS — duration under 5 minutes with Docker layer cache warm from previous attempts*
+
+**Stage 1 — Checkout:**
+
+![Stage checkout](docs/screenshots/33_stage_checkout.png)
+*Checkout — Jenkins cloned `microservices-demo`, checked out commit `e0cacb0c` ("test: trigger pipeline - CloudCommerce test v1")*
+
+**Stage 2 — Build Image:**
+
+![Stage build image](docs/screenshots/34_stage_build_image.png)
+*Build Image — Docker build completed in 70 seconds. ECR login succeeded via IAM instance profile. All Docker layers cached from previous attempts — only the final Go compilation (step #13) ran from scratch.*
+
+**Stage 3 — Scan with Trivy:**
+
+![Stage trivy scan](docs/screenshots/35_stage_trivy_scan.png)
+*Trivy scan — 5 HIGH vulnerabilities in Go stdlib v1.26.2, 0 CRITICAL. `--exit-code 0` means the scan reports without blocking the build.*
+
+The 5 HIGH vulnerabilities are all in the Go standard library, fixable by upgrading the Dockerfile base image from `golang:1.26.2-alpine` to `golang:1.26.3-alpine`:
+
+| CVE | Issue | Fixed in |
+|---|---|---|
+| CVE-2026-33811 | DNS CNAME lookup panic | Go 1.26.3 |
+| CVE-2026-33814 | HTTP/2 infinite loop | Go 1.26.3 |
+| CVE-2026-39820 | Email parser crash | Go 1.26.3 |
+| CVE-2026-39836 | NUL byte panic on Windows | Go 1.26.3 |
+| CVE-2026-42499 | DoS via phrase parser | Go 1.26.3 |
+
+**Stage 4 — Push to ECR:**
+
+![Stage push to ECR](docs/screenshots/36_stage_push_ecr.png)
+*Push to ECR — image `cloudcommerce/frontend:e0cacb0c` pushed successfully. All 18 layers uploaded.*
+
+**Stage 5 — Update values.yaml:**
+
+![Stage update values.yaml](docs/screenshots/37_stage_update_values_yaml.png)
+*Update values.yaml — Jenkins cloned `cloudcommerce-devops`, updated `kubernetes/apps/online-boutique/values.yaml` with the new ECR image tag, and committed with `[skip ci]` to prevent an infinite loop.*
+
+---
+
+### The Two Commit IDs — Understanding the Pipeline Audit Trail
+
+The successful build produced two distinct commit IDs:
+
+```
+Developer's commit:  e0cacb0c  ← pushed to microservices-demo (app code change)
+Jenkins' commit:     977548c   ← pushed to cloudcommerce-devops (values.yaml update)
+```
+
+![Two commit IDs explained](docs/screenshots/38_two_commit_ids_explained.png)
+*cloudcommerce-devops commit history — Jenkins' commit `977548c` updating values.yaml with image tag `e0cacb0c`. Two repos, two commits, one pipeline.*
+
+| Commit ID | Created by | Repository | Records |
+|---|---|---|---|
+| `e0cacb0c` | Developer (Dennis4507) | microservices-demo | Application code change |
+| `977548c` | Jenkins | cloudcommerce-devops | Image tag `e0cacb0c` written into values.yaml |
+
+The developer's commit ID is used in two places:
+1. As the Docker image tag in ECR: `cloudcommerce/frontend:e0cacb0c`
+2. Written into `values.yaml` by Jenkins: `tag: "e0cacb0c"`
+
+Jenkins' commit (`977548c`) is what ArgoCD detects — it watches `cloudcommerce-devops`, not `microservices-demo`. When ArgoCD sees `977548c`, it reads the updated `values.yaml`, finds image tag `e0cacb0c`, pulls that image from ECR, and deploys it to k3s.
+
+**The `[skip ci]` tag** prevents an infinite loop: without it, Jenkins would see its own push to `cloudcommerce-devops` as a new event, trigger another build, push again, loop forever.
+
+**Full audit trail for any deployed image:**
+```
+k3s running:     cloudcommerce/frontend:e0cacb0c
+    ↑ deployed by ArgoCD detecting Jenkins commit 977548c in cloudcommerce-devops
+        ↑ Jenkins built and pushed image tagged e0cacb0c
+            ↑ triggered by developer commit e0cacb0c in microservices-demo
+                ↑ "test: trigger pipeline - CloudCommerce test v1" by Dennis4507
+```
+
+---
+
+### Progress (Updated)
+- [x] Jenkins credentials restored — aws-account-id and github-token under Global scope
+- [x] cloudcommerce-frontend pipeline recreated — Pipeline script from SCM, GITScm webhook trigger
+- [x] GitHub webhook recreated — push to microservices-demo triggers Jenkins instantly
+- [x] Root cause diagnosed — Jenkins was actually running on t2.micro (1GB RAM), not t3.medium
+- [x] Instance resized to t3.medium via AWS Console — IaC-safe approach, no terraform apply
+- [x] terraform.tfvars updated to t3.medium — IaC kept in sync
+- [x] First successful pipeline build — all 5 stages completed cleanly
+- [x] Docker image `e0cacb0c` pushed to ECR — `cloudcommerce/frontend:e0cacb0c`
+- [x] Trivy scan — 5 HIGH (Go stdlib v1.26.2), 0 CRITICAL, fixable by upgrading to 1.26.3
+- [x] values.yaml updated — Jenkins commit `977548c` with `[skip ci]`
+- [x] Two commit IDs documented — developer's `e0cacb0c` vs Jenkins' `977548c`
+- [ ] Rebuild k3s via Ansible playbook
+- [ ] Reinstall ArgoCD
+- [ ] Redeploy Online Boutique via ArgoCD
+- [ ] Run first full end-to-end pipeline → ECR → ArgoCD → k3s deploy
 
 ---
 
