@@ -25,9 +25,9 @@
 # Declare variables to be passed into your templates.
 
 images:
-  repository: 927311782753.dkr.ecr.eu-central-1.amazonaws.com/cloudcommerce
+  repository: gcr.io/google-samples/microservices-demo
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "e0cacb0c"
+  tag: "v0.10.5"
 
 serviceAccounts:
   # Specifies whether service accounts should be created.
@@ -125,6 +125,11 @@ emailService:
 frontend:
   create: true
   name: frontend
+  image:
+    repository: 927311782753.dkr.ecr.eu-central-1.amazonaws.com/cloudcommerce/frontend  # JENKINS_UPDATES_REPOSITORY
+    tag: "e0cacb0c"  # JENKINS_UPDATES_TAG
+  imagePullSecrets:
+    - name: ecr-credentials
   externalService: false
   cymbalBranding: false
   # One of: local, gcp, aws, azure, onprem, alibaba. When not set, defaults to "local" unless running in GKE, otherwise auto-sets to gcp.

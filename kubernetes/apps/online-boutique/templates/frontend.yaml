@@ -50,6 +50,10 @@ spec:
       {{- else }}
       serviceAccountName: default
       {{- end }}
+      {{- if .Values.frontend.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.frontend.imagePullSecrets | nindent 8 }}
+      {{- end }}
       {{- if .Values.securityContext.enable }}
       securityContext:
         fsGroup: 1000
@@ -70,7 +74,7 @@ spec:
                 - ALL
             privileged: false
             readOnlyRootFilesystem: true
-          image: {{ .Values.images.repository }}/{{ .Values.frontend.name }}:{{ .Values.images.tag | default .Chart.AppVersion }}
+          image: {{ if and .Values.frontend.image .Values.frontend.image.repository }}{{ .Values.frontend.image.repository }}:{{ .Values.frontend.image.tag | default .Chart.AppVersion }}{{ else }}{{ .Values.images.repository }}/{{ .Values.frontend.name }}:{{ .Values.images.tag | default .Chart.AppVersion }}{{ end }}
           ports:
           - containerPort: 8080
           readinessProbe:
