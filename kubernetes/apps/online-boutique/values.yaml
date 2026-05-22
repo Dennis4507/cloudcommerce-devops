@@ -3,8 +3,8 @@
 # images.repository will be updated to our ECR registry once Jenkins is
 # building and pushing images:
 #   images:
-#     repository: <account-id>.dkr.ecr.eu-central-1.amazonaws.com/cloudcommerce
-#     tag: "<git-commit-sha>"   ← Jenkins writes this after every build
+#     repository: 927311782753.dkr.ecr.eu-central-1.amazonaws.com/cloudcommerce
+#     tag: "e0cacb0c"
 #
 # Copyright 2024 Google LLC
 #
@@ -25,9 +25,9 @@
 # Declare variables to be passed into your templates.
 
 images:
-  repository: us-central1-docker.pkg.dev/google-samples/microservices-demo
+  repository: 927311782753.dkr.ecr.eu-central-1.amazonaws.com/cloudcommerce
   # Overrides the image tag whose default is the chart appVersion.
-  tag: ""
+  tag: "e0cacb0c"
 
 serviceAccounts:
   # Specifies whether service accounts should be created.
