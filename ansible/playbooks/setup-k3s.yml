@@ -22,6 +22,35 @@
       delay: 10
       changed_when: false
 
+    - name: Get ECR login token
+      command: aws ecr get-login-password --region eu-central-1 --profile cloudcommerce
+      register: ecr_token
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: Configure ECR registry authentication for k3s
+      copy:
+        dest: /etc/rancher/k3s/registries.yaml
+        content: |
+          configs:
+            "927311782753.dkr.ecr.eu-central-1.amazonaws.com":
+              auth:
+                username: "AWS"
+                password: "{{ ecr_token.stdout }}"
+        mode: '0600'
+
+    - name: Restart k3s to apply registry configuration
+      systemd:
+        name: k3s
+        state: restarted
+
+    - name: Wait for k3s to be ready after restart
+      wait_for:
+        port: 6443
+        delay: 10
+        timeout: 60
+
     - name: Get kubeconfig
       command: cat /etc/rancher/k3s/k3s.yaml
       register: kubeconfig
