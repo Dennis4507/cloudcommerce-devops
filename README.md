@@ -2157,10 +2157,186 @@ k3s running:     cloudcommerce/frontend:e0cacb0c
 - [x] Trivy scan — 5 HIGH (Go stdlib v1.26.2), 0 CRITICAL, fixable by upgrading to 1.26.3
 - [x] values.yaml updated — Jenkins commit `977548c` with `[skip ci]`
 - [x] Two commit IDs documented — developer's `e0cacb0c` vs Jenkins' `977548c`
-- [ ] Rebuild k3s via Ansible playbook
+- [x] k3s rebuilt via Ansible playbook — clean uninstall, fresh install with `--tls-san`
+- [x] x509 certificate error diagnosed and resolved — root cause: KUBECONFIG env var pointing to Windows path
+- [x] kubectl connected — `kubectl get nodes` returns node Ready
 - [ ] Reinstall ArgoCD
 - [ ] Redeploy Online Boutique via ArgoCD
 - [ ] Run first full end-to-end pipeline → ECR → ArgoCD → k3s deploy
+
+---
+
+## Phase 3 Continued — k3s Rebuild After Terraform Incident
+
+The Terraform AMI incident (documented in Phase 2) destroyed both EC2 servers. The k3s server that was fully running with ArgoCD and Online Boutique was gone. This section documents the rebuild from scratch — and the x509 certificate debugging marathon that followed.
+
+---
+
+### Step 1 — Uninstall k3s and Remove Docker
+
+Before reinstalling k3s, the existing partial installation and unused Docker installation were removed cleanly.
+
+k3s ships its own uninstall script at `/usr/local/bin/k3s-uninstall.sh`. Running it removes k3s, its certificates, systemd service, data directory, and all generated configuration:
+
+```bash
+sudo /usr/local/bin/k3s-uninstall.sh
+```
+
+![k3s uninstall](docs/screenshots/112-k3s-uninstall.png)
+*k3s-uninstall.sh running — removes k3s binary, certificates, systemd service, and all cluster data. Clean slate for reinstall.*
+
+Docker was also removed. As covered in the EC2 learning notes, k3s uses containerd (built-in) and does not need Docker. It had been installed by the Terraform `user_data` script out of habit and was wasting ~200MB of disk space:
+
+```bash
+sudo apt-get remove -y docker-ce docker-ce-cli containerd.io
+sudo apt-get autoremove -y
+```
+
+---
+
+### Step 2 — Reinstall k3s via Ansible with --tls-san
+
+The first time k3s was installed, the TLS certificate did not include the public Elastic IP (`63.184.235.88`). kubectl from outside the VPC could not connect. The fix — adding `--tls-san 63.184.235.88` to the install command — was already in the Ansible playbook from that debugging session.
+
+With the playbook already correct, the reinstall was a single Ansible command:
+
+```bash
+ansible-playbook -i inventory/hosts.yml playbooks/setup-k3s.yml
+```
+
+The playbook runs:
+```bash
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--tls-san 63.184.235.88" sh -
+```
+
+`INSTALL_K3S_EXEC` passes flags to the k3s server process. `--tls-san` (Subject Alternative Name) adds the public IP to the TLS certificate at install time, so kubectl can verify the connection from outside the server.
+
+![Ansible k3s reinstall with TLS SAN](docs/screenshots/113-ansible-k3s-reinstall-tls-san.png)
+*Ansible playbook running — INSTALL_K3S_EXEC="--tls-san 63.184.235.88" included in the k3s install command*
+
+![k3s reinstall success](docs/screenshots/114-k3s-reinstall-success.png)
+*Playbook complete — all tasks ok, k3s installed, node reached Ready state with certificate including public IP*
+
+---
+
+### Step 3 — Copy the Kubeconfig from the Server
+
+kubectl needs the cluster's credentials file (kubeconfig) on the local machine to connect. On the k3s server, this file lives at `/etc/rancher/k3s/k3s.yaml`. The file is owned by root — a normal `scp` as the `ubuntu` user is denied:
+
+![kubeconfig permission denied](docs/screenshots/115-kubeconfig-permission-denied.png)
+*`/etc/rancher/k3s/k3s.yaml: Permission denied` — the file is owned by root, scp as ubuntu cannot read it*
+
+The workaround: use SSH to run `sudo cat` on the server and redirect the output into a local file. This stays within a single SSH session and never requires the file to be readable by ubuntu:
+
+```bash
+ssh -i ~/.ssh/cloudcommerce-dev-key ubuntu@63.184.235.88 "sudo cat /etc/rancher/k3s/k3s.yaml" > ~/k3s-fresh.yaml
+```
+
+![sudo cat kubeconfig](docs/screenshots/116-sudo-cat-kubeconfig.png)
+*SSH one-liner — `sudo cat` reads the root-owned file on the server; stdout is redirected into a local file*
+
+The file was checked to confirm it was written correctly (18 lines is the correct size for a k3s kubeconfig):
+
+```bash
+wc -l ~/k3s-fresh.yaml
+```
+
+![kubeconfig wc check](docs/screenshots/119-kubeconfig-wc-check.png)
+*18 lines — the complete kubeconfig including cluster CA certificate, client certificate, and client key*
+
+The server IP was then replaced — k3s writes `127.0.0.1` (localhost) in the kubeconfig because it assumes local access. For remote access, the public Elastic IP is needed:
+
+```bash
+sed -i 's/127.0.0.1/63.184.235.88/g' ~/k3s-fresh.yaml
+```
+
+Confirmed the correct server address:
+
+```bash
+grep "server:" ~/k3s-fresh.yaml
+# → server: https://63.184.235.88:6443
+```
+
+![kubeconfig server check](docs/screenshots/120-kubeconfig-server-check.png)
+*grep server — confirms the kubeconfig now points at the public Elastic IP, not localhost*
+
+---
+
+### Challenge: x509 Certificate Error — Persistent Despite Fresh Install
+
+Despite a clean reinstall with `--tls-san` and a fresh kubeconfig copy, `kubectl get nodes` kept returning the same error:
+
+```
+Unable to connect to the server: x509: certificate signed by unknown authority
+```
+
+![x509 error](docs/screenshots/121-x509-error.png)
+*x509: certificate signed by unknown authority — even after reinstalling k3s with --tls-san and copying a fresh kubeconfig*
+
+![x509 error persistent](docs/screenshots/122-x509-error-persistent.png)
+*Same error after repeated kubeconfig copies — the error is not the kubeconfig content itself*
+
+**Diagnostic: Is the public IP actually in the certificate?**
+
+The TLS SAN list on the server's certificate was checked directly using `openssl`:
+
+```bash
+openssl s_client -connect 63.184.235.88:6443 </dev/null 2>/dev/null | openssl x509 -noout -text | grep -A2 "Subject Alternative"
+```
+
+Output:
+```
+X509v3 Subject Alternative Name:
+    DNS:ip-10-0-1-23, DNS:kubernetes, DNS:kubernetes.default, ...
+    IP Address:63.184.235.88, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1
+```
+
+![openssl SAN verified](docs/screenshots/123-openssl-san-verified.png)
+*openssl confirms `IP Address:63.184.235.88` is in the certificate — the --tls-san flag worked correctly*
+
+The public IP was in the certificate. The problem was not the certificate content.
+
+**Root cause: KUBECONFIG environment variable pointing at the wrong file**
+
+The KUBECONFIG environment variable tells kubectl where to find its config file. Checking it revealed the real problem:
+
+```bash
+echo $KUBECONFIG
+# → /mnt/c/Users/OnlyM/.kube/config
+```
+
+`/mnt/c/Users/OnlyM/.kube/config` is the **Windows** `.kube` folder, mounted inside WSL. Every time the kubeconfig was copied, it went to `/home/denis/.kube/config` — the **WSL** home directory. kubectl was never reading that file. It was always reading the stale Windows kubeconfig left over from the original session before the Terraform incident.
+
+**Fix — copy to the correct location:**
+
+```bash
+cp ~/k3s-fresh.yaml /mnt/c/Users/OnlyM/.kube/config
+```
+
+---
+
+### kubectl Connected — Node Ready
+
+```bash
+kubectl get nodes
+```
+
+![kubectl get nodes success](docs/screenshots/124-kubectl-get-nodes-success.png)
+*kubectl get nodes — NAME: ip-10-0-1-23, STATUS: Ready, ROLES: control-plane. Remote access to the k3s cluster confirmed.*
+
+```
+NAME           STATUS   ROLES           AGE   VERSION
+ip-10-0-1-23   Ready    control-plane   36m   v1.35.5+k3s1
+```
+
+**What this taught:**
+
+The x509 error had three separate layers:
+1. First occurrence (original session): `--tls-san` was missing — public IP not in the certificate. Fixed by updating the Ansible playbook.
+2. Second occurrence (rebuild session): The certificate was correct (confirmed by openssl), but KUBECONFIG was pointing at the Windows path — every kubeconfig copy went to the wrong location.
+3. The `Unauthorized` error when testing with `--insecure-skip-tls-verify` confirmed that TLS was the only issue — once the right kubeconfig file was in place, connectivity and authentication both worked immediately.
+
+**Lesson:** Always check `echo $KUBECONFIG` before diagnosing TLS errors. If it points to a different path than where you are copying files, every copy is invisible to kubectl.
 
 ---
 
