@@ -7,6 +7,8 @@
 
     - name: Download and install k3s with public IP in TLS certificate
       shell: curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--tls-san 63.184.235.88" sh -
+      args:
+        creates: /usr/local/bin/k3s
 
     - name: Wait for k3s API server to be available
       wait_for:
