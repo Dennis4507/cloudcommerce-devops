@@ -4,7 +4,7 @@
 # building and pushing images:
 #   images:
 #     repository: 927311782753.dkr.ecr.eu-central-1.amazonaws.com/cloudcommerce
-#     tag: "e0cacb0c"
+#     tag: "887892a0"
 #
 # Copyright 2024 Google LLC
 #
@@ -27,7 +27,7 @@
 images:
   repository: 927311782753.dkr.ecr.eu-central-1.amazonaws.com/cloudcommerce
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "e0cacb0c"
+  tag: "887892a0"
 
 serviceAccounts:
   # Specifies whether service accounts should be created.
