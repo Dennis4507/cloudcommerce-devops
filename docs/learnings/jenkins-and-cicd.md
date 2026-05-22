@@ -556,6 +556,102 @@ Pipeline starts building within seconds
 
 Without the webhook, Jenkins would poll GitHub every few minutes — delay between push and build. With the webhook, the build starts within seconds of the push.
 
+## CPU Credit Exhaustion — How t2/t3 Instances Throttle Under Load
+
+This is different from an OOM (Out of Memory) kill and is important to understand when sizing CI servers.
+
+**What CPU credits are:**
+
+t2 and t3 instance types are "burstable" — they can use more CPU than their baseline for short periods by spending CPU credits. Credits accumulate when the instance is idle and drain when it runs above baseline.
+
+| Instance | Baseline CPU | Credits earned/hr |
+|---|---|---|
+| t2.micro | 10% | 6 |
+| t3.medium | 20% | 24 |
+
+**What happens when credits run out:**
+
+Under sustained heavy load (Docker build + Go compilation), a t2.micro burns through all its credits within minutes. Once exhausted, CPU is throttled to 10% baseline. A compilation that normally takes 70 seconds stretches to hours. The Jenkins JVM, running on the same throttled CPU, becomes too slow to serve web requests — the browser times out.
+
+**This is NOT an OOM kill.** OOM kills a process when RAM is exhausted. CPU throttling is invisible — the process is still running, just extremely slowly. `dmesg | grep oom` returns nothing.
+
+**How to diagnose:**
+
+```bash
+top
+# load average >> number of CPUs  (e.g., 17.14 on a 2-core machine)
+# high %wa (disk I/O wait — CPU-starved processes backing up)
+# %id near 0% (no idle CPU)
+```
+
+**What this teaches:** t2/t3 burstable instances are designed for spiky, low-average workloads — web servers, APIs. CI/CD pipelines that compile code for sustained periods are the wrong use case. Use `m5`, `c5`, or `r5` types for build agents if using the master+agent architecture.
+
+---
+
+## Exit Code -1 — Jenkins Lost Connection vs Build Failure
+
+When Jenkins shows `ERROR: script returned exit code -1`, this is **not** a build logic failure.
+
+**What it means:** Jenkins lost track of the running process. The process was running, Jenkins restarted or the connection broke, and Jenkins can no longer determine the outcome.
+
+**Real failure looks like:**
+```
+Step 5/8 : RUN apt-get install something
+E: Unable to locate package something
+ERROR: script returned exit code 1   ← positive number = real error
+```
+
+**Lost connection looks like:**
+```
+#13 [builder 6/6] RUN go build ...
+Resuming build at ... after Jenkins restart
+wrapper script does not seem to be touching the log file
+ERROR: script returned exit code -1   ← negative = lost connection
+```
+
+The tells: `Resuming build after Jenkins restart` and `wrapper script does not seem to be touching the log file`. The build may have actually succeeded — Jenkins just doesn't know.
+
+**What to do:** Fix the underlying cause (e.g., resize the instance), then re-run the build.
+
+---
+
+## Resizing EC2 via AWS Console vs Terraform
+
+After discovering Jenkins was running on t2.micro (not t3.medium), there were two options to resize:
+
+**Option A — Terraform:** Update `terraform.tfvars`, run `terraform apply`. For an instance type change, Terraform stops, resizes, and starts — it does NOT destroy the instance. However, after the AMI incident (Incident 2) where a Terraform apply destroyed both servers, the console approach was chosen as the safer option.
+
+**Option B — AWS Console:** Stop instance → Actions → Instance Settings → Change Instance Type → Start. Surgical — changes exactly one thing.
+
+**The rule:** Whichever option you use, always update the IaC to match immediately:
+
+```hcl
+# terraform.tfvars — must reflect reality
+jenkins_instance_type = "t3.medium"
+```
+
+If the code still said `t2.micro` and someone ran `terraform apply` later, Terraform would resize back. Keeping IaC in sync prevents that drift.
+
+---
+
+## First Successful Pipeline Build — What Each Stage Did
+
+Build triggered 2026-05-22, commit `e0cacb0c`, all 5 stages passed on t3.medium.
+
+**Stage 1 — Checkout:** Jenkins cloned `microservices-demo`, checked out `e0cacb0c`.
+
+**Stage 2 — Build Image (70 seconds):** Multi-stage Docker build. Builder stage: `golang:1.26.2-alpine` compiled the Go binary. Runtime stage: `gcr.io/distroless/static` — binary only, no shell, no OS packages. All Docker layers from previous attempts were cached — only step #13 (Go compilation) ran.
+
+**Stage 3 — Trivy Scan:** Found 5 HIGH vulnerabilities in Go stdlib v1.26.2, all fixed in v1.26.3. `--exit-code 0` means pipeline continues — scan reports without blocking.
+
+**Stage 4 — Push to ECR:** Image `cloudcommerce/frontend:e0cacb0c` pushed. ECR authenticated via IAM instance profile — no credentials.
+
+**Stage 5 — Update values.yaml:** Jenkins cloned `cloudcommerce-devops`, updated `values.yaml` with new ECR tag, committed `977548c` with `[skip ci]`, pushed. This is the commit ArgoCD will detect on the next deploy.
+
+**Post-build cleanup:** Docker image deleted from Jenkins disk. Cloned infra folder deleted — removes the GitHub token from the filesystem.
+
+---
+
 ## Interview Talking Points
 
 - "Jenkins is installed and configured via Ansible — the entire setup is reproducible from code, including Java runtime, GPG key import, repository configuration, and initial service startup"
