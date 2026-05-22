@@ -48,6 +48,23 @@ root_block_device {
 
 ## user_data — Automating First Boot
 
+Think of `user_data` as a **note you leave for the server before it switches on for the first time.**
+
+When AWS creates a new EC2 instance, it reads that note and follows the instructions automatically — before anyone has even logged in. Once it has run, it never runs again. If you start and stop the server a hundred times, the note is only read once — at the very first boot.
+
+In Terraform, this note is written directly in the EC2 resource:
+
+```hcl
+user_data = <<-EOF
+  #!/bin/bash
+  apt-get install -y docker-ce
+  systemctl enable docker
+  systemctl start docker
+EOF
+```
+
+AWS takes that script, runs it as the root user the moment the server first powers on, and that's it.
+
 `user_data` is a shell script that EC2 runs automatically the first time an instance boots. It runs as root, before any user logs in. We used it to install Docker on both servers:
 
 ```bash
@@ -64,14 +81,56 @@ systemctl start docker
 
 This is why Docker was already installed and running when we SSH'd in. We never touched the server manually. The infrastructure bootstrapped itself.
 
-## Why Docker on Both Servers
+## Why Docker on Both Servers — And Why k3s Doesn't Actually Need It
 
-| Server | Why Docker |
-|--------|-----------|
-| Jenkins | Builds Docker images from source code, then pushes them to ECR |
-| k3s | k3s uses containerd (a component of Docker) as its container runtime — every Kubernetes pod runs inside a container |
+**Jenkins genuinely needs Docker** — it builds container images (`docker build`) and pushes them to ECR (`docker push`). Without Docker, the Jenkins pipeline cannot function.
 
-Without Docker on Jenkins, it cannot build images. Without a container runtime on k3s, Kubernetes has no way to actually run containers.
+**k3s does NOT need Docker.** This is a common misconception.
+
+k3s ships with **containerd** built in as its container runtime. Containerd is the low-level engine that pulls images from ECR and runs containers inside Kubernetes pods. Docker is a higher-level tool built on top of containerd — it adds a user-friendly CLI and build capabilities. k3s bypasses Docker entirely and talks directly to containerd.
+
+```
+Jenkins server:                    k3s server:
+Docker (needed)                    containerd (built into k3s — this is what's needed)
+  ├── docker build                 Docker (installed by user_data — NOT actually needed)
+  ├── docker push → ECR
+  └── docker login
+```
+
+**Why Docker is installed on k3s anyway:**
+
+The Terraform `user_data` script installs Docker on both servers identically. It was written this way out of habit — a common pattern of "install Docker everywhere." For k3s it does no harm but wastes ~200MB of disk space and install time. Removing it from the k3s `user_data` is a documented cleanup task.
+
+---
+
+## user_data vs Ansible — What Belongs Where
+
+This distinction matters for understanding why Docker is in `user_data` but k3s is installed via Ansible.
+
+**user_data is right for:**
+- Software that installs identically on every server with zero configuration
+- No IP addresses, no certificates, no environment-specific flags
+- Install-and-forget — runs once at first boot, never needs to run again
+
+Docker is a perfect fit: `apt-get install docker-ce` is the same command on every Ubuntu server everywhere. No configuration needed.
+
+**Ansible is right for:**
+- Software that needs specific values (IP addresses, hostnames, flags)
+- Anything you might need to reinstall without destroying the server
+- Anything that must be repeatable and recoverable
+
+k3s requires `--tls-san 63.184.235.88` — the Elastic IP address baked into the TLS certificate. That IP is specific to this server and must match for `kubectl` to connect remotely. If k3s were in `user_data`, reinstalling it (as we did after the Terraform AMI incident) would require destroying and rebuilding the entire EC2 instance. With Ansible, it is one command that takes minutes.
+
+**The rule:**
+```
+user_data  → zero-config, install-once software (Docker, basic packages)
+Ansible    → configured software, anything needing specific values or re-runnability
+```
+
+**Real example from this project:**
+- Docker in user_data ✓ — same on every server, no flags, never needs reinstalling
+- k3s in Ansible ✓ — needs --tls-san IP, needed reinstalling after the AMI incident
+- k3s in user_data ✗ — would have required destroying the server to reinstall
 
 ## SSH Key Authentication
 

@@ -429,6 +429,52 @@ Instead of guessing which file contained the right key, we told the keyserver: "
 
 **Task ordering matters:** Any task with `update_cache: yes` in the `apt` module triggers a full apt update across all repositories — including Jenkins. If the Jenkins repository is already added (from a previous failed run) but the key is wrong, even installing unrelated packages like Java will fail. The key and repository setup must always come first in the playbook.
 
+## Ansible vs user_data — Choosing the Right Tool
+
+Both Ansible and Terraform's `user_data` can install software on a server. Choosing the wrong one creates problems that are hard to recover from.
+
+**What is user_data?**
+
+It is a note you leave for the server before it switches on for the very first time. AWS reads it and runs it automatically at first boot — before anyone has logged in. It only ever runs once. If you stop and start the server a hundred times, the note is read just once.
+
+**user_data** runs once, at first boot, automatically. You never trigger it manually. If something goes wrong or needs changing, you have to destroy and recreate the instance to run it again.
+
+**Ansible** runs on demand, any time, from your machine. You can re-run it after failures, run it on existing servers, and update it without touching the infrastructure.
+
+**The deciding question: does this software need configuration specific to this server?**
+
+If **no** → user_data is fine. Example: Docker. `apt-get install docker-ce` is identical on every Ubuntu server. No IP addresses, no certificates, no flags. Install once, never think about it again.
+
+If **yes** → use Ansible. Example: k3s. It requires `--tls-san 63.184.235.88` — the server's own Elastic IP baked into the TLS certificate. That IP is different per server and must be correct for remote `kubectl` access to work.
+
+```
+Software          | Config needed?  | Tool
+──────────────────┼─────────────────┼─────────
+Docker            | No              | user_data ✓
+Java              | No              | user_data or Ansible
+Jenkins           | Yes (Java ver,  | Ansible ✓
+                  | GPG keys, port) |
+k3s               | Yes (--tls-san  | Ansible ✓
+                  | IP address)     |
+ArgoCD            | Yes (NodePort,  | Ansible ✓
+                  | namespaces)     |
+```
+
+**Why this matters in practice:**
+
+After the Terraform AMI incident destroyed both servers, we rebuilt everything with Ansible in minutes:
+```bash
+ansible-playbook setup-jenkins.yml   # Jenkins back
+ansible-playbook setup-k3s.yml       # k3s back
+ansible-playbook setup-argocd.yml    # ArgoCD back
+```
+
+If k3s had been installed via user_data, "rebuilding" would mean destroying and recreating the instance — and hoping the user_data ran correctly with no way to debug it interactively.
+
+Ansible gives you visibility, control, and the ability to re-run. user_data gives you automation at the cost of flexibility.
+
+---
+
 ## Interview Talking Points
 
 - "I use Ansible for server configuration because it's agentless — there's nothing to install or maintain on target servers, which reduces attack surface and operational overhead"
