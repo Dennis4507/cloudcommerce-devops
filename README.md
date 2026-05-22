@@ -29,7 +29,7 @@ Developer pushes code to GitHub
          ▼ webhook
     ┌─────────────┐
     │   Jenkins   │  ← CI/CD on EC2 t3.medium (eu-central-1)
-    │  Pipeline   │    Build → Scan → Push → Trigger
+    │  Pipeline   │    Build → Scan → Push → Update values.yaml
     └──────┬──────┘
            │ triggers ArgoCD sync
            ▼
@@ -2174,9 +2174,9 @@ k3s running:     cloudcommerce/frontend:e0cacb0c
 
 ---
 
-## Phase 5 — Security + Load Test *(upcoming)*
+## Phase 5 — Security + Load Test *(in progress)*
 
-- [ ] Integrate Trivy image scanning into Jenkins pipeline
+- [x] Integrate Trivy image scanning into Jenkins pipeline — scanning on every build, 5 HIGH found in Go stdlib v1.26.2 (fix: upgrade to 1.26.3)
 - [ ] Deploy HashiCorp Vault for secrets management
 - [ ] Write k6 load test scripts
 - [ ] Run load test and observe HPA scaling in real time

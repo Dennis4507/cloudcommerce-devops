@@ -301,6 +301,51 @@ Using `-out=tfplan` means the apply uses the exact plan you reviewed — not a n
 
 Thirty seconds reading the plan can save hours of recovery work.
 
+## IaC Drift — When Code and Reality Diverge
+
+IaC drift is when what your code says and what actually exists in AWS are different. It is more common than expected and can cause silent problems that are hard to trace.
+
+**How it happened in this project:**
+
+`terraform.tfvars` had `jenkins_instance_type = "t2.micro"`. The assumption throughout the project was that Jenkins was running on `t3.medium`. It was not — it was always t2.micro. Every Jenkins crash, every throttle, every failed build was caused by this single line in a config file that was never verified against reality.
+
+The mismatch went unnoticed because:
+- Nobody ran `terraform plan` to check if the deployed state matched the code
+- The Jenkins UI loaded (slowly) — there was no hard error, just poor performance
+- The assumption "we set it to t3.medium" was never verified with `top` or the AWS console
+
+**How to detect drift:**
+
+```bash
+terraform plan
+```
+
+If Terraform shows changes you did not expect, the code and reality have diverged. For example:
+
+```
+~ aws_instance.jenkins
+  ~ instance_type = "t3.medium" -> "t2.micro"  # forces update
+```
+
+This would have immediately revealed the mismatch — the code says t3.medium but AWS reports t2.micro.
+
+**How drift happens in practice:**
+
+1. Someone changes something in the AWS console and forgets to update the code
+2. Code is updated but `terraform apply` is never run
+3. A previous apply failed partway through, leaving some resources updated and some not
+4. Manual emergency fixes are made under pressure and not reflected in code
+
+**The discipline:**
+
+- After any manual console change — update the IaC immediately, same session
+- Run `terraform plan` at the start of any session where you expect to make infra changes — it confirms reality matches code before you do anything
+- `terraform plan` is read-only and safe to run any time
+
+**What this teaches:** Code that is never applied is not IaC — it is documentation. The value of IaC comes from it being the authoritative source of truth. If the code and the real infrastructure diverge, you lose that guarantee.
+
+---
+
 ## Interview Talking Points
 
 - "I use Terraform modules to separate reusable infrastructure blueprints from environment-specific configuration — the same modules serve both dev and prod with different variable values"
