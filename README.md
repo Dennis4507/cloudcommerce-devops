@@ -2160,9 +2160,15 @@ k3s running:     cloudcommerce/frontend:e0cacb0c
 - [x] k3s rebuilt via Ansible playbook — clean uninstall, fresh install with `--tls-san`
 - [x] x509 certificate error diagnosed and resolved — root cause: KUBECONFIG env var pointing to Windows path
 - [x] kubectl connected — `kubectl get nodes` returns node Ready
-- [ ] Reinstall ArgoCD
-- [ ] Redeploy Online Boutique via ArgoCD
-- [ ] Run first full end-to-end pipeline → ECR → ArgoCD → k3s deploy
+- [x] ArgoCD reinstalled via Ansible — all pods healthy, application manifest applied
+- [x] ErrImagePull root cause diagnosed — Jenkinsfile only built `frontend`, global tag broken all 12 services
+- [x] Jenkinsfile rewritten — all 12 services built, scanned, and pushed to ECR in one pipeline run
+- [x] ECR authentication for containerd fixed — `/etc/rancher/k3s/registries.yaml` configured via Ansible
+- [x] Ansible idempotency guard added — `args.creates: /usr/local/bin/k3s` prevents accidental k3s reinstall
+- [x] Jenkins Build #5 — all 12 images pushed to ECR with tag `887892a0`
+- [x] ArgoCD synced — all 12 pods Running in online-boutique namespace
+- [x] Online Boutique permanently exposed at http://63.184.235.88 via LoadBalancer (externalService: true)
+- [x] Pipeline separation verified — Jenkins watches microservices-demo, ArgoCD watches cloudcommerce-devops
 
 ---
 
@@ -2337,6 +2343,349 @@ The x509 error had three separate layers:
 3. The `Unauthorized` error when testing with `--insecure-skip-tls-verify` confirmed that TLS was the only issue — once the right kubeconfig file was in place, connectivity and authentication both worked immediately.
 
 **Lesson:** Always check `echo $KUBECONFIG` before diagnosing TLS errors. If it points to a different path than where you are copying files, every copy is invisible to kubectl.
+
+---
+
+## Phase 3 Continued — ArgoCD, ECR Auth, and the Full Pipeline
+
+With kubectl connected and the cluster healthy, the next step was reinstalling ArgoCD and deploying Online Boutique through the full GitOps pipeline.
+
+---
+
+### Step 4 — Reinstall ArgoCD After k3s Rebuild
+
+The Ansible playbook for ArgoCD was re-run to reinstall the controller on the fresh k3s cluster:
+
+```bash
+ansible-playbook -i inventory/hosts playbooks/setup-argocd.yml
+```
+
+![ArgoCD Ansible reinstall](docs/screenshots/125-argocd-ansible-reinstall.png)
+*Ansible playbook running — reinstalling ArgoCD on the fresh k3s cluster*
+
+ArgoCD pods were verified healthy before applying the application manifest:
+
+![ArgoCD pods healthy](docs/screenshots/126-argocd-pods-healthy.png)
+*All ArgoCD pods in Running state — controller, server, repo-server, applicationset-controller, redis*
+
+The application manifest was then checked and applied:
+
+```bash
+kubectl apply -f kubernetes/argocd/online-boutique.yaml
+```
+
+![Check kubectl manifest](docs/screenshots/127-check-kubectl-manifest.png)
+*Confirming the application manifest exists before applying*
+
+![kubectl apply ArgoCD app](docs/screenshots/128-kubectl-apply-argocd-app.png)
+*`application.argoproj.io/online-boutique created` — ArgoCD application registered and watching the repo*
+
+ArgoCD immediately began syncing — pulling the Helm chart from the cloudcommerce-devops repo and deploying resources to the cluster:
+
+![ArgoCD UI syncing](docs/screenshots/129-argocd-ui-syncing.png)
+*ArgoCD dashboard showing the online-boutique application syncing — resources being created in the cluster*
+
+---
+
+### Challenge: All Pods in ErrImagePull / ImagePullBackOff
+
+Within minutes of syncing, ArgoCD reported the application as degraded:
+
+![ArgoCD pods degraded](docs/screenshots/130-argocd-pods-degraded.png)
+*ArgoCD UI — all pods yellow/red, health status degraded across every service*
+
+![ArgoCD health degraded](docs/screenshots/131-argocd-health-degraded.png)
+*App health: Degraded — the deployment succeeded but pods cannot start*
+
+Every pod in the `online-boutique` namespace was failing to pull its image:
+
+```bash
+kubectl get pods -n online-boutique
+# All pods: ErrImagePull or ImagePullBackOff
+```
+
+![ErrImagePull on all pods](docs/screenshots/132-errimagepull-all-pods.png)
+*kubectl get pods — every service showing ErrImagePull or ImagePullBackOff, only redis-cart Running*
+
+**Root cause — Jenkinsfile only built `frontend`:**
+
+The `values.yaml` uses a single global image configuration that applies to all 12 services:
+
+```yaml
+images:
+  repository: 927311782753.dkr.ecr.eu-central-1.amazonaws.com/cloudcommerce
+  tag: "e0cacb0c"
+```
+
+![Helm ECR global config](docs/screenshots/133-helm-ecr-global-config.png)
+*values.yaml showing the global images block — this tag is used for all 12 services*
+
+Jenkins was only building and pushing `frontend`. When it updated the global `tag`, it pointed all 12 services at an ECR tag that only existed for `frontend`. The other 11 services had no images in ECR at all.
+
+Describing a failing pod confirmed the exact error:
+
+```bash
+kubectl describe pod adservice-5c945f559b-m2mrx -n online-boutique
+```
+
+![kubectl describe ErrImagePull](docs/screenshots/134-kubectl-describe-errimagepull.png)
+*Events: Failed to pull image — `pull access denied` or `manifest unknown` — image does not exist in ECR*
+
+**First attempt — imagePullSecret (partial fix):**
+
+An ECR `imagePullSecret` was created in the namespace to ensure k3s had credentials to pull:
+
+```bash
+kubectl create secret docker-registry ecr-credentials \
+  --docker-server=927311782753.dkr.ecr.eu-central-1.amazonaws.com \
+  --docker-username=AWS \
+  --docker-password=$(aws ecr get-login-password --region eu-central-1)
+  -n online-boutique
+```
+
+![ECR imagePullSecret](docs/screenshots/135-ecr-imagepullsecret.png)
+*ecr-credentials secret created in online-boutique namespace — gives k3s credentials to authenticate with ECR*
+
+This addressed the authentication layer, but the underlying problem remained: most images simply did not exist in ECR yet.
+
+---
+
+### Fix — Rewrite Jenkinsfile to Build All 12 Services
+
+The Jenkinsfile was rewritten to build every service in a single pipeline run using a `build_scan_push()` shell function:
+
+```groovy
+build_scan_push adservice             src/adservice
+build_scan_push cartservice           src/cartservice/src
+build_scan_push checkoutservice       src/checkoutservice
+build_scan_push currencyservice       src/currencyservice
+build_scan_push emailservice          src/emailservice
+build_scan_push frontend              src/frontend
+build_scan_push loadgenerator         src/loadgenerator
+build_scan_push paymentservice        src/paymentservice
+build_scan_push productcatalogservice src/productcatalogservice
+build_scan_push recommendationservice src/recommendationservice
+build_scan_push shippingservice       src/shippingservice
+build_scan_push shoppingassistantservice src/shoppingassistantservice
+```
+
+Note: `cartservice` is a special case — its Dockerfile lives at `src/cartservice/src/` (nested one level deeper than the other services). Every other service follows `src/<service-name>/`.
+
+The fix was pushed to `microservices-demo`:
+
+![Jenkinsfile all services push](docs/screenshots/136-jenkinsfile-all-services-push.png)
+*git push to microservices-demo — Jenkinsfile rewritten to build all 12 services in one run*
+
+Helm chart values were also corrected to remove per-service image overrides and rely solely on the global ECR config:
+
+![Helm chart fixes push](docs/screenshots/137-helm-chart-fixes-push.png)
+*Helm chart values and templates pushed — all 12 services using global images.repository + images.tag*
+
+---
+
+### Challenge: Pods Stuck in Pending — Node Resource Pressure
+
+After Jenkins Build #5 finished and ArgoCD synced, pods were still not starting:
+
+![Pods pending resource pressure](docs/screenshots/138-pods-pending-resource-pressure.png)
+*kubectl get pods — new pods created but all Pending, old ImagePullBackOff pods still present*
+
+New pods showed `Pending` rather than `ErrImagePull`, meaning they couldn't be scheduled at all — they hadn't even tried to pull images. ArgoCD showed the app as synced despite the pod state:
+
+![adservice new pod ErrImagePull](docs/screenshots/139-adservice-new-pod-errimagepull.png)
+*New adservice pod also showing ErrImagePull — images exist in ECR but k3s still can't authenticate*
+
+![ArgoCD still degraded](docs/screenshots/140-argocd-still-degraded.png)
+*ArgoCD UI — Synced but Health: Degraded — the Git state is applied but pods haven't converged*
+
+**What was happening:** Kubernetes rolling updates create new pods before terminating old ones. The old `ImagePullBackOff` pods were still consuming their CPU and memory reservations (~1500m CPU for 11 services). The node was at 88% CPU request utilisation — no room for new pods to schedule. This is the classic rolling-update deadlock on a resource-constrained single node.
+
+---
+
+### Challenge: Ansible Accidentally Reinstalled k3s
+
+During this debugging session, the Ansible `setup-k3s.yml` playbook was re-run without a guard, and k3s was reinstalled unnecessarily — wiping the cluster and requiring ArgoCD to be reinstalled again:
+
+![k3s accidental reinstall](docs/screenshots/141-k3s-accidental-reinstall.png)
+*k3s reinstalled by Ansible — cluster wiped, all pods and ArgoCD gone, rebuild required*
+
+**Fix — added idempotency guard to the install task:**
+
+```yaml
+- name: Download and install k3s
+  shell: curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--tls-san 63.184.235.88" sh -
+  args:
+    creates: /usr/local/bin/k3s   # skip if binary already exists
+```
+
+The `creates` argument makes the task idempotent — if `/usr/local/bin/k3s` already exists, Ansible skips the shell command entirely. Running the playbook on an already-provisioned server is now safe.
+
+---
+
+### ECR Authentication for k3s (containerd)
+
+Unlike Docker, k3s uses `containerd` internally — and containerd does not automatically inherit IAM role credentials. Without explicit configuration, even a valid IAM role on the EC2 instance is not used when pulling images.
+
+The fix was added to the Ansible playbook: a `registries.yaml` file is written to `/etc/rancher/k3s/registries.yaml` before k3s starts, giving containerd a permanent ECR token:
+
+```yaml
+configs:
+  "927311782753.dkr.ecr.eu-central-1.amazonaws.com":
+    auth:
+      username: "AWS"
+      password: "{{ ecr_token.stdout }}"
+```
+
+The ECR token is fetched from the local machine via `aws ecr get-login-password` during the playbook run, then written to the server. k3s is restarted to pick up the new configuration. This is a permanent, playbook-managed credential — no imagePullSecrets needed at the pod level.
+
+---
+
+### Jenkins Build #5 — All 12 Services Built and Pushed
+
+With the rewritten Jenkinsfile, Build #5 ran the complete pipeline: build → Trivy scan → push for all 12 services sequentially, then updated `values.yaml` with the new commit tag `887892a0`:
+
+![Jenkins Build #5 success](docs/screenshots/142-jenkins-build5-success.png)
+*Jenkins Build #5 complete — all 12 services built, scanned, and pushed to ECR, values.yaml updated*
+
+---
+
+### All Pods Running — ArgoCD Synced
+
+ArgoCD detected the `values.yaml` commit and synced:
+
+![ArgoCD synced pods pending](docs/screenshots/143-argocd-synced-pods-pending.png)
+*ArgoCD shows Synced — even while pods were still transitioning through Pending state*
+
+Once the old pods were garbage-collected and resources freed, the new pods scheduled and reached Running:
+
+```bash
+kubectl get pods -n online-boutique
+```
+
+![All pods running](docs/screenshots/144-all-pods-running.png)
+*All 12 services Running — 3rd generation ReplicaSets (19m old), all old RSes at DESIRED=0*
+
+**Three generations of ReplicaSets** were visible in `kubectl get rs`:
+- **143m** — first deploy, `ImagePullBackOff` (images didn't exist)
+- **78m** — second deploy, `Pending` (images existed but node was resource-exhausted)
+- **19m** — third deploy, all `READY=1` ✓
+
+---
+
+### Online Boutique Live
+
+With all pods running, the frontend was accessed via port-forward:
+
+```bash
+kubectl port-forward svc/frontend 8080:80 -n online-boutique
+```
+
+![Online Boutique frontend live](docs/screenshots/145-boutique-frontend-live.png)
+*Online Boutique storefront — all 12 microservices running, product catalog loading from productcatalogservice*
+
+![Boutique shopping cart](docs/screenshots/146-boutique-shopping-cart.png)
+*Shopping cart working — cartservice and Redis communicating correctly, checkout flow functional*
+
+---
+
+### Challenge: Port-Forward Doesn't Survive Terminal Close
+
+The next morning, the site was unreachable:
+
+![Port 8080 connection refused](docs/screenshots/147-port8080-connection-refused.png)
+*ERR_CONNECTION_REFUSED on localhost:8080 — port-forward process died when the terminal closed*
+
+`kubectl port-forward` is a foreground process tied to a terminal session. It is not a persistent service — it exits when the terminal closes or the session ends.
+
+Restoring it temporarily:
+
+```bash
+kubectl port-forward svc/frontend 8080:80 -n online-boutique
+```
+
+![Port-forward restored](docs/screenshots/148-portforward-restored.png)
+*Site back at localhost:8080 after restarting port-forward — confirms pods are still healthy*
+
+---
+
+### Fix — Expose Frontend via Public IP (Permanently)
+
+Port-forward is a development tool, not a production access method. The correct fix: enable the `externalService` flag in `values.yaml`, which creates a `LoadBalancer` type Kubernetes service. k3s's built-in ServiceLB (Klipper) exposes LoadBalancer services on the node's public IP.
+
+![NodePort plan](docs/screenshots/149-nodeport-plan.png)
+*Planning the permanent exposure — externalService: true creates a LoadBalancer service via k3s ServiceLB*
+
+One line changed in `values.yaml`:
+
+```yaml
+frontend:
+  externalService: true   # was: false
+```
+
+![values.yaml externalService true](docs/screenshots/150-values-externalservice-true.png)
+*values.yaml edit — externalService: false → true, one line change to expose the frontend permanently*
+
+The change was committed and pushed to `cloudcommerce-devops`. ArgoCD detected it and synced — no Jenkins build needed because this is a Kubernetes config change, not an application code change. Traefik (k3s's built-in ingress controller) picked up the LoadBalancer service and began routing port 80 on the public Elastic IP to the frontend pod.
+
+![Online Boutique at public IP](docs/screenshots/151-boutique-public-ip-live.png)
+*Online Boutique live at http://63.184.235.88 — no port-forward, no terminal, permanent access via Elastic IP*
+
+Port-forward is no longer needed or used:
+
+![Port 8080 superseded](docs/screenshots/152-port8080-superseded.png)
+*localhost:8080 no longer serving — the public IP is now the access point*
+
+---
+
+### Pipeline Verification — ArgoCD vs Jenkins Separation of Concerns
+
+To verify the pipeline end-to-end, a test push was made to `cloudcommerce-devops` to observe Jenkins behaviour:
+
+![gitpush cloudcommerce-devops test](docs/screenshots/154-gitpush-cloudcommerce-devops-test.png)
+*git push to cloudcommerce-devops repo — testing whether Jenkins triggers*
+
+Jenkins did not trigger:
+
+![Jenkins not triggered devops repo](docs/screenshots/155-jenkins-not-triggered-devops-repo.png)
+*Jenkins build did NOT trigger — Jenkins watches `microservices-demo`, not `cloudcommerce-devops`*
+
+This confirmed the separation of concerns is working correctly:
+- **Jenkins** listens to `microservices-demo` (application code) → builds images → pushes to ECR → updates `values.yaml`
+- **ArgoCD** listens to `cloudcommerce-devops` (infrastructure config) → syncs Helm chart → deploys to k3s
+
+A push to `microservices-demo` then confirmed Jenkins triggers as expected:
+
+![Jenkins triggered boutique repo](docs/screenshots/156-jenkins-triggered-boutique-repo.png)
+*Jenkins build triggered immediately on push to microservices-demo — CI/CD pipeline functioning end to end*
+
+Jenkins also pushed the automated `ci: update all services to 887892a0` commit to `cloudcommerce-devops` after the build, which required a `git pull --rebase` before the next local push — because both Jenkins and the local machine had written to the same branch.
+
+![Jenkins CI push values](docs/screenshots/153-jenkins-ci-push-values.png)
+*Jenkins automated commit to cloudcommerce-devops — `ci: update all services to 887892a0 [skip ci]` — ArgoCD picks this up and syncs*
+
+---
+
+### Phase 3 Summary — What Was Built
+
+| Component | Status |
+|-----------|--------|
+| k3s cluster (single node, Elastic IP) | Running |
+| kubectl remote access | Configured |
+| ArgoCD GitOps controller | Running |
+| ECR authentication (containerd via registries.yaml) | Configured |
+| Jenkins pipeline (all 12 services) | Running |
+| Trivy image scanning | Integrated |
+| Online Boutique (12 microservices) | Running |
+| Public URL | http://63.184.235.88 |
+
+**The full pipeline:**
+```
+git push (microservices-demo)
+  → Jenkins: build → Trivy scan → push to ECR → update values.yaml
+    → ArgoCD: detect commit → sync Helm chart → apply to k3s
+      → containerd: pull from ECR (via registries.yaml)
+        → 12 pods Running → http://63.184.235.88 live
+```
 
 ---
 
