@@ -229,6 +229,54 @@ The password is stored in a Kubernetes secret and printed by the Ansible playboo
 
 Jenkins and ArgoCD never talk to each other. Their only connection is the Git repository. This is the GitOps separation of concerns.
 
+## Synced vs Healthy — Two Separate States
+
+ArgoCD tracks two independent dimensions for every application:
+
+| Dimension | What it means | Green = |
+|-----------|--------------|---------|
+| **Sync Status** | Does the cluster match Git? | Cluster state matches values.yaml |
+| **Health Status** | Are the resources actually working? | All pods Running and Ready |
+
+**You can be Synced but Degraded.** This is an important distinction:
+- ArgoCD applied the Helm chart correctly → **Synced** ✓
+- All pods are in `ImagePullBackOff` or `Pending` → **Degraded** ✗
+
+ArgoCD's job is to apply what's in Git. Whether the application actually works after that is the health check's job. When pods can't pull images, ArgoCD correctly reports: "I applied what you told me to, but the result is unhealthy."
+
+This separation matters in debugging: if ArgoCD shows **OutOfSync**, the problem is between Git and the cluster (manifest, Helm rendering, permissions). If ArgoCD shows **Synced + Degraded**, the problem is inside the application — image pull failures, crash loops, failed readiness probes.
+
+## What ArgoCD Watches vs What Jenkins Watches
+
+A critical separation that prevents confusion:
+
+```
+microservices-demo repo  ←── Jenkins watches this
+  (application code, Dockerfiles)
+  Developer pushes here → Jenkins builds images
+
+cloudcommerce-devops repo ←── ArgoCD watches this
+  (Helm charts, values.yaml, Kubernetes manifests)
+  Jenkins writes here (automated values.yaml commit)
+  ArgoCD reads here → deploys to k3s
+```
+
+Pushing a config change to `cloudcommerce-devops` does **not** trigger Jenkins — Jenkins has no awareness of that repo. It only triggers ArgoCD. Pushing code to `microservices-demo` does **not** trigger ArgoCD directly — it triggers Jenkins, which then writes to `cloudcommerce-devops`, which ArgoCD then picks up.
+
+The two tools are connected only through Git — they never talk to each other directly.
+
+## ArgoCD Polling — How Fast It Detects Changes
+
+ArgoCD polls the Git repository every **3 minutes** by default. This means after Jenkins pushes the updated `values.yaml`, there can be up to a 3-minute delay before ArgoCD detects the change and begins syncing.
+
+For faster response, a GitHub webhook can be configured to notify ArgoCD on every push — this reduces detection time to seconds. Without a webhook, the 3-minute poll is the default behaviour.
+
+You can also force a sync manually:
+```bash
+kubectl get application online-boutique -n argocd
+# or through the ArgoCD UI → Sync button
+```
+
 ## Interview Talking Points
 
 - "ArgoCD is the CD layer in our platform — it watches GitHub and automatically syncs the cluster to match whatever is in the repository. Every deployment is traceable to a git commit."

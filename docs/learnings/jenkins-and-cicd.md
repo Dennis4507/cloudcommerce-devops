@@ -652,6 +652,72 @@ Build triggered 2026-05-22, commit `e0cacb0c`, all 5 stages passed on t3.medium.
 
 ---
 
+## Building Multiple Services in One Pipeline
+
+When a global image tag applies to all services (as in this project's `values.yaml`), every service must be built and pushed in the same pipeline run. Building only one service and updating the global tag causes all other services to point at a tag that doesn't exist in ECR — resulting in `ImagePullBackOff` on every pod except the one that was built.
+
+The pattern: define a shell function inside the pipeline and call it once per service:
+
+```groovy
+sh '''
+    build_scan_push() {
+        SERVICE=$1
+        BUILD_PATH=$2
+        ECR_IMAGE="${ECR_REGISTRY}/cloudcommerce/${SERVICE}:${IMAGE_TAG}"
+
+        docker build -t ${ECR_IMAGE} ${BUILD_PATH}
+        trivy image --exit-code 0 --severity HIGH,CRITICAL ${ECR_IMAGE}
+        docker push ${ECR_IMAGE}
+        docker rmi ${ECR_IMAGE} || true
+    }
+
+    build_scan_push frontend              src/frontend
+    build_scan_push cartservice           src/cartservice/src
+    build_scan_push adservice             src/adservice
+    # ... all 12 services
+'''
+```
+
+**Special cases matter:** `cartservice` has its Dockerfile at `src/cartservice/src/` — one level deeper than every other service. Getting this wrong produces a build error that only affects cartservice. Always check each service's directory structure before writing the build paths.
+
+## Jenkins as an Automated Git Committer
+
+After pushing images to ECR, Jenkins clones the infrastructure repo, updates `values.yaml` with the new image tag, and pushes a commit back to GitHub:
+
+```bash
+git clone https://${GIT_USER}:${GIT_TOKEN}@github.com/Dennis4507/cloudcommerce-devops.git infra
+cd infra
+sed -i "s|  tag:.*|  tag: \"${IMAGE_TAG}\"|" kubernetes/apps/online-boutique/values.yaml
+git commit -m "ci: update all services to ${IMAGE_TAG} [skip ci]"
+git push
+```
+
+This commit is what ArgoCD detects — it is the handoff point between CI (Jenkins) and CD (ArgoCD).
+
+**`[skip ci]` is essential.** Without it, Jenkins pushing to GitHub would trigger another Jenkins build (because Jenkins watches GitHub). That build would push another commit, triggering another build — an infinite loop. The `[skip ci]` tag tells Jenkins to ignore commits that contain it.
+
+## Git Conflicts Between Jenkins and Developer — git pull --rebase
+
+Because Jenkins writes to `cloudcommerce-devops` (via the automated values.yaml commit), and developers also occasionally write to the same repo (manual config changes), they can conflict:
+
+```
+Remote (GitHub):  A → B → [Jenkins commit]
+Local machine:    A → B → [Your commit]
+```
+
+GitHub rejects a push where the pusher's history doesn't include the remote's latest commit. The fix:
+
+```bash
+git pull --rebase
+git push
+```
+
+**What `--rebase` does:** Instead of creating a merge commit (which would show the two parallel timelines being joined), rebase replays your commit on top of the remote's latest. The result is a clean, linear history — as if your commit happened after Jenkins' commit, not at the same time.
+
+**Why this matters in large teams:** Manual `git pull --rebase` is a developer workaround. In a well-designed system, developers never write directly to the config repo — Jenkins is the only writer to `values.yaml`. The conflict only surfaces when a developer manually edits a file that automation owns. The long-term fix is strict repo separation enforced by branch protection rules.
+
+**In automated pipelines:** Jenkins' own push script can include retry logic — `git pull --rebase && git push` in a loop — so the pipeline handles the conflict without human intervention.
+
 ## Interview Talking Points
 
 - "Jenkins is installed and configured via Ansible — the entire setup is reproducible from code, including Java runtime, GPG key import, repository configuration, and initial service startup"

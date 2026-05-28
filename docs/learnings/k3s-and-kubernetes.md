@@ -212,6 +212,141 @@ kubectl is a single binary (`kubectl.exe`) that needs to be on the Windows PATH.
 
 This writes to the user's environment in the registry. New terminal sessions inherit it automatically. The current session needs to be restarted, or set `$env:PATH` temporarily for the current session.
 
+## ReplicaSets — How Kubernetes Manages Rolling Updates
+
+A **ReplicaSet** is the Kubernetes object that ensures a specific number of identical pods are always running. Every Deployment manages one or more ReplicaSets behind the scenes.
+
+When you deploy a new image version, Kubernetes does not modify the existing pods. It:
+1. Creates a **new ReplicaSet** with the new image definition
+2. Scales the new RS up (starts new pods)
+3. Scales the old RS down (terminates old pods)
+4. Keeps old RSes around at `DESIRED=0` for rollback history
+
+```
+kubectl get rs -n online-boutique
+
+NAME                    DESIRED   CURRENT   READY   AGE
+adservice-5c945f559b    0         0         0       143m   ← old (kept for rollback)
+adservice-75564965fc    0         0         0       78m    ← older failed attempt
+adservice-7b7f5f9696    1         1         1       19m    ← current live RS
+```
+
+**Rollback uses the old RS** — `kubectl rollout undo` simply scales the previous RS back to 1 and scales the current one to 0. It does not need the old pods — it needs the old RS definition (which remembers the old image tag). Kubernetes keeps up to 10 RS revisions by default.
+
+## Rolling Update Deadlock — Single Node Resource Pressure
+
+On a single-node cluster with tight resources, rolling updates can deadlock:
+
+**The deadlock:**
+1. Old pods are running and consuming CPU/memory reservations
+2. New pods are created but stuck `Pending` — cannot be scheduled (no room)
+3. Old pods only terminate when new pods reach `Running`
+4. New pods can never reach `Running` because old pods won't free resources
+5. The cluster is stuck
+
+**How to diagnose:**
+```bash
+kubectl describe node | grep -A 5 "Allocated resources"
+# → cpu: 88% requested, 141% limits — overcommitted
+```
+
+**Solutions:**
+
+| Solution | How | Trade-off |
+|----------|-----|-----------|
+| `Recreate` strategy | Kill all old pods first, then create new | Brief downtime |
+| `maxUnavailable: 1, maxSurge: 0` | Kill one old pod before creating new one | No extra resource usage |
+| Bigger node | More CPU/RAM on EC2 | Higher cost |
+
+**`Recreate` does NOT break rollback.** Rollback lives in the ReplicaSet definition, not the pods. Old RS stays in etcd regardless of strategy.
+
+## Deployment Strategies
+
+**RollingUpdate (default):**
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 25%         # how many extra pods during update
+    maxUnavailable: 25%   # how many pods can be down during update
+```
+Zero downtime if resources allow. Can deadlock on a tight single node.
+
+**Recreate:**
+```yaml
+strategy:
+  type: Recreate
+```
+All old pods terminated before any new pods start. Brief downtime. No resource surge. Correct choice for single-node development clusters.
+
+## Service Types — How Traffic Reaches Pods
+
+Pods are ephemeral — they come and go. Services are stable endpoints that route traffic to whatever pods are currently running.
+
+| Type | Who can reach it | How |
+|------|-----------------|-----|
+| `ClusterIP` | Only other pods inside the cluster | Internal DNS name |
+| `NodePort` | Anyone with the node's IP + port | `http://IP:30000-32767` |
+| `LoadBalancer` | Public internet | Cloud provider assigns external IP |
+
+**In k3s specifically:** LoadBalancer services are handled by **ServiceLB (Klipper)** — k3s's built-in load balancer. It exposes the service on the node's public IP. k3s also ships with **Traefik** as an ingress controller, which already holds port 80 and 443. When you create a LoadBalancer service on port 80, Traefik picks it up and routes it automatically.
+
+## Port-Forward — Development Tool, Not Production Access
+
+```bash
+kubectl port-forward svc/frontend 8080:80 -n online-boutique
+```
+
+This tunnels a local port to a pod through the Kubernetes API server. It:
+- Only works while the terminal is open and the command is running
+- Exits when you close the terminal or press Ctrl+C
+- Is not a service, not a load balancer, not persistent
+- Is the correct tool for temporary debugging access
+
+**For permanent access:** use a `LoadBalancer` service or an `Ingress` resource. In this project, setting `externalService: true` in `values.yaml` creates a LoadBalancer service that Traefik picks up — the site then lives permanently at the node's public Elastic IP with no terminal required.
+
+## ECR Authentication for containerd (registries.yaml)
+
+k3s uses `containerd` as its container runtime — not Docker. Docker and containerd are both container runtimes, but they have separate credential systems.
+
+**The problem:** Even though the k3s EC2 instance has an IAM role that allows ECR pulls, containerd does not automatically use IAM credentials. Without explicit configuration, every image pull from ECR returns `no basic auth credentials`.
+
+**The fix:** Write a `registries.yaml` file to `/etc/rancher/k3s/registries.yaml` before k3s starts:
+
+```yaml
+configs:
+  "927311782753.dkr.ecr.eu-central-1.amazonaws.com":
+    auth:
+      username: "AWS"
+      password: "<ecr-token>"
+```
+
+This file is read by containerd at startup. The ECR token is fetched from the local machine during the Ansible playbook run using `aws ecr get-login-password`, then written to the server. k3s must be restarted to pick up the new configuration.
+
+**ECR tokens expire after 12 hours.** The Ansible playbook approach means the token is refreshed every time the playbook runs. For a production setup, this would be automated via a CronJob or IAM-based credential provider.
+
+**imagePullSecrets vs registries.yaml:**
+- `imagePullSecrets` is a Kubernetes-level credential — attached to a pod or ServiceAccount
+- `registries.yaml` is a containerd-level credential — applies to all pulls on the node
+- `registries.yaml` is the correct permanent solution; `imagePullSecrets` works but expires every 12 hours and must be regenerated
+
+## k9s — Terminal UI for Kubernetes
+
+k9s is a terminal-based UI built on top of kubectl. It provides real-time cluster navigation without memorising full kubectl syntax for every operation.
+
+```bash
+k9s --command pods    # open directly to pods view
+```
+
+**What k9s shows that kubectl doesn't by default:**
+- CPU and memory usage per pod in real time
+- Pod age, restart count, and status in a single view
+- Log tailing with `l` key — no need to remember pod names
+- Shell access into a pod with `s` key
+- Resource deletion with `ctrl+d`
+
+**k9s vs kubectl:** k9s is for exploration and debugging. kubectl is for scripted operations, CI/CD, and anything that needs to be repeatable. Both are used — k9s does not replace kubectl, it complements it.
+
 ## Interview Talking Points
 
 - "k3s is a CNCF-certified Kubernetes distribution — fully compatible with upstream kubectl, Helm, and Kubernetes manifests, but packaged as a single binary and running under 512MB RAM at idle"
@@ -219,3 +354,9 @@ This writes to the user's environment in the registry. New terminal sessions inh
 - "kubeconfig must be re-copied every time k3s is reinstalled — the certificate-authority-data changes with each new cluster, and using the old kubeconfig produces authentication errors even if the server address is correct"
 - "I use k9s for day-to-day cluster navigation alongside kubectl — it shows CPU/memory per pod in real time and makes log tailing and pod inspection faster without replacing kubectl for scripted operations"
 - "kubectl on Windows was installed by downloading the .exe via WSL curl — PowerShell's Invoke-WebRequest had TLS and connection issues; WSL curl is more reliable for binary downloads"
+- "ReplicaSets are what Kubernetes uses to manage rolling updates — each new deployment creates a new RS and scales the old one down. Old RSes are kept at DESIRED=0 for rollback history. Rollback is just scaling the previous RS back up"
+- "We hit a rolling update deadlock on a single-node cluster — old ImagePullBackOff pods were consuming resource reservations, new pods couldn't schedule, and old pods wouldn't terminate until new ones were Ready. The solution is Recreate strategy on resource-constrained single nodes"
+- "Recreate strategy does not break rollback — rollback lives in the ReplicaSet definition stored in etcd, not in the running pods"
+- "containerd does not automatically use IAM credentials for ECR pulls — unlike Docker, containerd needs explicit registry configuration in /etc/rancher/k3s/registries.yaml. Without it, even a correctly configured IAM role produces 'no basic auth credentials'"
+- "Port-forward is a development debugging tool — it tunnels a local port through the Kubernetes API server and exits when the terminal closes. For permanent external access, LoadBalancer services or Ingress resources are the correct approach"
+- "In k3s, LoadBalancer services are handled by Klipper ServiceLB and Traefik — a LoadBalancer service on port 80 is automatically picked up by Traefik and exposed on the node's public IP"
