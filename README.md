@@ -2586,6 +2586,10 @@ kubectl port-forward svc/frontend 8080:80 -n online-boutique
 ![Boutique shopping cart](docs/screenshots/146-boutique-shopping-cart.png)
 *Shopping cart working — cartservice and Redis communicating correctly, checkout flow functional*
 
+**Demo video — full walkthrough of the live site:**
+
+https://github.com/Dennis4507/cloudcommerce-devops/raw/main/docs/screenshots/Online%20Boutique%20-%20Google%20Chrome%202026-05-23%2012-32-43.mp4
+
 ---
 
 ### Challenge: Port-Forward Doesn't Survive Terminal Close
@@ -2689,13 +2693,138 @@ git push (microservices-demo)
 
 ---
 
-## Phase 4 — Observability *(upcoming)*
+## Phase 4 — Observability
 
-- [ ] Deploy Prometheus + Grafana stack
+**Progress:**
+- [x] Prometheus + Grafana deployed via ArgoCD — kube-prometheus-stack Helm chart
+- [x] Real-time cluster metrics confirmed — CPU, memory, network across all namespaces
+- [x] Grafana accessible at http://63.184.235.88:30030 — permanently exposed via NodePort
+- [x] AWS security group updated — port 30030 opened for Grafana access
 - [ ] Deploy Loki + Promtail for log aggregation
 - [ ] Configure AlertManager rules
-- [ ] Build Grafana dashboards for cluster and application metrics
 - [ ] Monitor HPA scaling events under k6 load
+
+---
+
+### Monitoring Stack — kube-prometheus-stack
+
+Rather than installing Prometheus and Grafana separately, the **kube-prometheus-stack** Helm chart installs the complete observability stack in a single deployment. One chart, five components:
+
+| Component | Role |
+|-----------|------|
+| Prometheus | Scrapes and stores metrics from every pod |
+| Grafana | Visualises metrics as dashboards |
+| Prometheus Operator | Manages Prometheus configuration via Kubernetes CRDs |
+| kube-state-metrics | Exposes Kubernetes object metrics (pod state, deployment replicas) |
+| node-exporter | Exposes host-level metrics (EC2 CPU, disk, network) |
+
+The monitoring stack follows the same GitOps pattern as Online Boutique — config lives in Git, ArgoCD deploys it.
+
+**Files added:**
+- `kubernetes/monitoring/kube-prometheus-stack-values.yaml` — resource limits tuned for single t3.medium node
+- `kubernetes/argocd/monitoring.yaml` — ArgoCD Application pointing at Prometheus community Helm repo
+- `terraform/modules/ec2/main.tf` — port 30030 added to k3s security group
+
+---
+
+### Step 1 — Deploy via ArgoCD
+
+The ArgoCD Application manifest was applied to register the monitoring stack:
+
+```bash
+kubectl apply -f kubernetes/argocd/monitoring.yaml
+```
+
+ArgoCD pulled the `kube-prometheus-stack` chart version `65.8.0` from the Prometheus community Helm repository and applied the values file from our Git repo. A pre-sync hook ran first — a one-time Job that generates TLS certificates for the admission webhook — before the main components were deployed.
+
+![kubectl monitoring pods running](docs/screenshots/157-kubectl-pods-monitoring-running.png)
+*All 5 monitoring pods Running — grafana, prometheus-operator, kube-state-metrics, node-exporter, prometheus*
+
+---
+
+### Challenge: Grafana Unreachable — Port Blocked by Security Group
+
+With all pods Running, the Grafana NodePort was confirmed on port 30030:
+
+```bash
+kubectl get svc -n monitoring | grep grafana
+# monitoring-grafana   NodePort   10.43.33.87   <none>   80:30030/TCP
+```
+
+But the browser returned a timeout:
+
+![Grafana connection timeout](docs/screenshots/158-grafana-connection-timeout.png)
+*ERR_CONNECTION_TIMED_OUT — port 30030 blocked by AWS security group*
+
+**Root cause:** The Terraform security group rule for port 30030 had been written to code but `terraform apply` had not been run. The AWS security group did not have the rule active.
+
+**Fix:** Added the inbound rule directly in the AWS console while the Terraform code was already updated for IaC consistency:
+
+![Security group port 30030 added](docs/screenshots/159-security-group-30030-added.png)
+*AWS EC2 Security Groups — Custom TCP port 30030 added, source 0.0.0.0/0 — Grafana now reachable*
+
+---
+
+### Grafana Live — Kubernetes Dashboards
+
+Grafana loaded immediately after the security group rule was saved:
+
+![Grafana login page](docs/screenshots/160-grafana-login-page.png)
+*Grafana login page at http://63.184.235.88:30030 — credentials: admin / cloudcommerce-grafana*
+
+The kube-prometheus-stack chart pre-loads a full set of Kubernetes dashboards automatically — no manual dashboard import needed:
+
+![Grafana Kubernetes dashboard](docs/screenshots/161-grafana-kubernetes-dashboard.png)
+*Grafana dashboard browser — pre-built Kubernetes dashboards loaded automatically by the Helm chart*
+
+---
+
+### Cluster Metrics — What Prometheus Is Showing
+
+The **Kubernetes / Compute Resources / Cluster** dashboard revealed the real resource picture:
+
+![Grafana cluster resources](docs/screenshots/162-grafana-cluster-resources.png)
+*Cluster overview — CPU utilisation 12%, memory utilisation 87.4%, metrics from all 4 namespaces*
+
+![Grafana cluster resources detail](docs/screenshots/163-grafana-cluster-resources-2.png)
+*CPU and memory breakdown by namespace — online-boutique, monitoring, argocd, kube-system*
+
+![Grafana namespace workloads](docs/screenshots/164-grafana-namespace-workloads.png)
+*Namespace workload view — per-pod CPU and memory usage across online-boutique namespace*
+
+**Key findings from the metrics:**
+
+| Metric | Value | What it means |
+|--------|-------|---------------|
+| CPU utilisation | 12% | Cluster is CPU-idle — headroom for real traffic |
+| CPU requests commitment | 99.5% | Kubernetes has almost fully reserved CPU via pod specs |
+| Memory utilisation | 87.4% | Real memory usage — worth monitoring closely |
+| online-boutique CPU actual | 52m (3.3% of reserved) | 12 pods use almost no CPU at idle |
+| monitoring memory actual | 664 MiB vs 492 MiB requested | Monitoring exceeds its own request — limits need tuning |
+| ArgoCD memory | 462 MiB | Higher than expected — normal for GitOps controller |
+
+**The CPU story:** 12% actual vs 99.5% reserved shows the difference between Kubernetes scheduling (reservations) and real usage. Pods reserve CPU defensively — actual consumption at idle is a fraction.
+
+**The memory story:** 87.4% actual memory usage is real and not just reservations. The monitoring stack using 135% of its requested memory means our values file underestimated Prometheus' needs. In production this would be corrected in the Helm values and re-deployed via ArgoCD.
+
+---
+
+### Why Monitoring Runs Inside k3s (and What Changes in Production)
+
+For this project, Prometheus and Grafana run as pods inside the same k3s cluster they monitor. This is a cost and resource decision — a second EC2 instance for monitoring would add ~$33/month for a portfolio project.
+
+The production-correct architecture keeps monitoring on a **separate node or cluster** so it survives if the monitored cluster goes down — you need to see the crash data, not lose it in the crash:
+
+```
+Production:
+App cluster (k3s/EKS)          Monitoring cluster (separate)
+  └── Online Boutique     →     ├── Prometheus (scraping app)
+                                └── Grafana (always accessible)
+```
+
+The setup, configuration, and dashboards are identical regardless. The separation is an operational maturity concern — understood and documented, correct choice deferred to the production phase.
+
+---
 
 ---
 
