@@ -1,0 +1,49 @@
+# Loki Stack Helm values
+# Tuned for single k3s node with limited memory headroom
+# Deploys: Loki (log storage) + Promtail (log collector agent)
+
+loki:
+  enabled: true
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+  # Store logs on local disk (simple, no PVC needed for portfolio)
+  persistence:
+    enabled: false
+
+  config:
+    # Keep only 24 hours of logs — saves disk space on single node
+    table_manager:
+      retention_deletes_enabled: true
+      retention_period: 24h
+
+# Promtail — agent that runs on every node and ships logs to Loki
+promtail:
+  enabled: true
+
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 50m
+      memory: 64Mi
+
+  config:
+    # Point Promtail at our Loki instance
+    clients:
+      - url: http://loki-stack.monitoring.svc.cluster.local:3100/loki/api/v1/push
+
+# Grafana already installed via kube-prometheus-stack — disable here
+grafana:
+  enabled: false
+
+# Prometheus already installed — disable here
+prometheus:
+  enabled: false
