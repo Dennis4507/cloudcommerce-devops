@@ -7,8 +7,7 @@ loki:
 
   resources:
     requests:
-      # No CPU request — node is at 99.5% CPU reservations despite only 16% actual use
-      # Omitting CPU request allows scheduling; limit still caps actual consumption
+      cpu: null    # explicitly removes chart default of 50m — node CPU requests at 99.5%
       memory: 64Mi
     limits:
       cpu: 100m
@@ -30,7 +29,7 @@ promtail:
 
   resources:
     requests:
-      # No CPU request — same reasoning as Loki above
+      cpu: null    # explicitly removes chart default
       memory: 32Mi
     limits:
       cpu: 50m
