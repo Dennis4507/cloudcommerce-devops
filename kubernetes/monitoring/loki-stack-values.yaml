@@ -7,7 +7,8 @@ loki:
 
   resources:
     requests:
-      cpu: 50m
+      # No CPU request — node is at 99.5% CPU reservations despite only 16% actual use
+      # Omitting CPU request allows scheduling; limit still caps actual consumption
       memory: 64Mi
     limits:
       cpu: 100m
@@ -29,7 +30,7 @@ promtail:
 
   resources:
     requests:
-      cpu: 10m
+      # No CPU request — same reasoning as Loki above
       memory: 32Mi
     limits:
       cpu: 50m
