@@ -1,0 +1,69 @@
+# kube-prometheus-stack Helm values
+# Tuned for a single k3s node (t3.medium — 2 vCPU, 4GB RAM)
+# Resource requests kept low to coexist with Online Boutique (12 services)
+
+grafana:
+  adminPassword: "cloudcommerce-grafana"
+
+  service:
+    type: NodePort
+    nodePort: 30030
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+  # Pre-built dashboards for Kubernetes
+  defaultDashboardsEnabled: true
+
+prometheus:
+  prometheusSpec:
+    # How long to keep metrics data
+    retention: 7d
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 300Mi
+      limits:
+        cpu: 300m
+        memory: 600Mi
+
+    # Only scrape metrics from our namespaces
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+
+alertmanager:
+  # Disable for now — Phase 5 will add alert rules
+  enabled: false
+
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 50m
+      memory: 64Mi
+
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 50m
+      memory: 64Mi
+
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
