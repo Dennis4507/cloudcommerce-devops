@@ -42,3 +42,4 @@ spec:
     syncOptions:
       - CreateNamespace=false
       - ServerSideApply=true
+      - RespectIgnoreDifferences=true  # actually skip applying ignored fields on sync
