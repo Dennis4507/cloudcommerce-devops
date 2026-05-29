@@ -82,8 +82,16 @@ alertmanager:
       group_interval: 5m     # wait 5m before sending new alerts for same group
       repeat_interval: 4h    # re-send if still firing after 4h
       receiver: 'gmail'
+      routes:
+        # Watchdog is an always-firing heartbeat alert — suppress it
+        # InfoInhibitor is a meta-alert used to silence info-level noise
+        - receiver: 'null'
+          matchers:
+            - alertname =~ "Watchdog|InfoInhibitor"
 
     receivers:
+      # null receiver — silently discards alerts routed to it (standard pattern)
+      - name: 'null'
       - name: 'gmail'
         email_configs:
           - to: 'riungudenis63@gmail.com'
