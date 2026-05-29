@@ -24,6 +24,17 @@ spec:
     server: https://kubernetes.default.svc
     namespace: monitoring
 
+  # Prevent ArgoCD from reverting our isDefault:false patch on the
+  # auto-generated loki-loki-stack datasource ConfigMap. The loki-stack chart
+  # always sets isDefault:true which conflicts with Prometheus being default.
+  ignoreDifferences:
+    - group: ""
+      kind: ConfigMap
+      name: loki-loki-stack
+      namespace: monitoring
+      jsonPointers:
+        - /data
+
   syncPolicy:
     automated:
       prune: true
