@@ -2700,7 +2700,8 @@ git push (microservices-demo)
 - [x] Real-time cluster metrics confirmed — CPU, memory, network across all namespaces
 - [x] Grafana accessible at http://63.184.235.88:30030 — permanently exposed via NodePort
 - [x] AWS security group updated — port 30030 opened for Grafana access
-- [ ] Deploy Loki + Promtail for log aggregation
+- [x] Loki + Promtail deployed via ArgoCD — full log aggregation from all 12 services
+- [x] Live log queries confirmed in Grafana Explore — structured JSON logs streaming
 - [ ] Configure AlertManager rules
 - [ ] Monitor HPA scaling events under k6 load
 
@@ -2825,6 +2826,216 @@ App cluster (k3s/EKS)          Monitoring cluster (separate)
 The setup, configuration, and dashboards are identical regardless. The separation is an operational maturity concern — understood and documented, correct choice deferred to the production phase.
 
 ---
+
+### Log Aggregation — Loki + Promtail
+
+With metrics covered by Prometheus, the second observability pillar is **logs**. Loki is Prometheus for logs — instead of scraping metrics endpoints, Promtail runs as a DaemonSet on every node and ships container logs directly into Loki's storage. Grafana queries both Prometheus and Loki from the same interface.
+
+**Files added:**
+- `kubernetes/monitoring/loki-stack-values.yaml` — resource limits tuned for single t3.medium, Grafana and Prometheus disabled (already installed)
+- `kubernetes/argocd/loki.yaml` — ArgoCD Application pulling loki-stack chart v2.10.2
+
+![Loki stack values yaml](docs/screenshots/165-loki-stack-values-yaml.png)
+*loki-stack-values.yaml — CPU requests explicitly set to null to bypass chart defaults; node at 99.5% CPU reservation*
+
+![kubectl apply loki argocd app](docs/screenshots/166-kubectl-apply-loki-argocd-app.png)
+*ArgoCD Application applied — loki-stack chart registered for GitOps deployment*
+
+---
+
+### Challenge 1 — Loki Pod Stuck Pending: CPU Request Exhaustion
+
+The Loki pod came up Pending immediately:
+
+![Loki pods pending initial](docs/screenshots/167-loki-pods-pending-initial.png)
+*loki-0 Pending — node at 99.5% CPU requests, no room to schedule a new pod*
+
+The node's CPU was not being consumed (actual usage: 12%) but almost all of it was **reserved** via pod resource requests. Kubernetes uses requests for scheduling — a pod cannot be placed on a node that lacks the reserved capacity, even if real usage is low.
+
+![Loki debug commands](docs/screenshots/170-loki-debug-commands.png)
+*kubectl describe pod + kubectl get limitrange — confirmed CPU request exhaustion, no LimitRange auto-injection*
+
+**Fix attempt 1:** Remove the CPU request from the values file:
+
+![Remove Loki CPU request](docs/screenshots/168-remove-loki-cpu-request.png)
+*First attempt — removing cpu from requests section in loki-stack-values.yaml*
+
+![Loki still pending](docs/screenshots/169-loki-still-pending.png)
+*Still Pending — Helm merges values, it does not remove keys. Omitting a key leaves the chart default (50m) in place.*
+
+**Fix attempt 2:** Set `cpu: null` to explicitly override the chart default:
+
+![cpu null fix loki](docs/screenshots/171-cpu-null-fix-loki.png)
+*cpu: null in loki section — explicitly removes chart default of 50m; node CPU requests at 99.5%*
+
+![cpu null fix promtail](docs/screenshots/172-cpu-null-fix-promtail.png)
+*Same fix applied to promtail section — DaemonSet picked up the change and started Running immediately*
+
+![Loki still pending statefulset](docs/screenshots/173-loki-still-pending-statefulset.png)
+*Promtail Running but loki-0 still Pending — StatefulSet and DaemonSet handle updates differently*
+
+---
+
+### Challenge 2 — StatefulSet Template Race Condition
+
+The `cpu: null` fix worked for Promtail (DaemonSet) but not for Loki (StatefulSet). Investigating why:
+
+![Check loki resources](docs/screenshots/174-check-loki-resources.png)
+*Checking actual resource spec on the running pod — StatefulSet template showed cpu:0 but pod still had cpu:50m*
+
+![StatefulSet check](docs/screenshots/175-statefulset-check.png)
+*kubectl get statefulset — confirms StatefulSet exists and controls loki-0*
+
+![kubectl get pods monitoring w](docs/screenshots/176-kubectl-get-pods-monitoring-w.png)
+*Watching pods — loki-0 cycling through Pending, never reaching Running*
+
+**Root cause:** StatefulSet rolling updates only update **Running** pods, not Pending ones. The pod was stuck in Pending, so Kubernetes never replaced it. The StatefulSet template had been updated by ArgoCD but the actual pod kept its original `cpu:50m` spec from creation.
+
+Deleting the pod to force a recreate:
+
+![Delete statefulset timing race](docs/screenshots/177-delete-statefulset-timing-race.png)
+*kubectl delete pod loki-0 — pod deleted but recreated before ArgoCD could push the updated template*
+
+![Pod spec check cpu50m](docs/screenshots/178-pod-spec-check-cpu50m.png)
+*kubectl get pod loki-0 -o jsonpath — new pod spec still shows cpu:50m, not the null we set*
+
+![StatefulSet delete fix](docs/screenshots/179-statefulset-delete-fix.png)
+*The fix: delete the entire StatefulSet, not just the pod. ArgoCD recreates it from scratch with the current template.*
+
+```bash
+kubectl delete statefulset loki -n monitoring
+# ArgoCD detects drift within 3 minutes and recreates from Git — loki-0 starts with cpu:null
+```
+
+After deletion, ArgoCD recreated the StatefulSet from Git with the correct spec. loki-0 came up Running 1/1.
+
+---
+
+### Challenge 3 — Wrong Loki Service Name in Grafana
+
+With Loki running, the data source was configured in Grafana:
+
+![Grafana loki datasource config](docs/screenshots/180-grafana-loki-datasource-config.png)
+*Grafana data source configuration — URL set to loki-stack service name (incorrect)*
+
+![Loki connection failed](docs/screenshots/181-loki-connection-failed.png)
+*Unable to connect to Loki — URL pointed at loki-stack.monitoring.svc.cluster.local which does not exist*
+
+The service name is determined by the Helm release name, which comes from the ArgoCD Application name — not the chart name:
+
+![kubectl get svc loki](docs/screenshots/182-kubectl-get-svc-loki.png)
+*kubectl get svc -n monitoring | grep loki — service is named 'loki', not 'loki-stack'*
+
+![Loki service name correct](docs/screenshots/183-loki-service-name-correct.png)
+*ArgoCD app name = "loki" → Helm release = "loki" → service name = "loki". URL corrected to http://loki:3100*
+
+![Loki connection failed again](docs/screenshots/184-loki-connection-failed-again.png)
+*Still failing after URL change — Grafana showed "Unable to connect" even with the correct service name*
+
+Investigating from inside the cluster:
+
+![Loki health check](docs/screenshots/185-loki-health-check.png)
+*kubectl logs loki-0 — Loki startup logs, no errors*
+
+![Loki healthy running](docs/screenshots/186-loki-healthy-running.png)
+*wget http://loki.monitoring.svc.cluster.local:3100/ready from inside the Grafana pod → returns "ready". Network works — wrong URL in Grafana config.*
+
+The provisioned data source (added via `additionalDataSources` in kube-prometheus-stack values) cannot be edited from the Grafana UI — it shows "This data source was added by config". A second data source `loki-1` was added manually with the correct URL as a workaround, while the values file was updated in Git for the permanent fix.
+
+---
+
+### Challenge 4 — Node Memory Exhaustion and Grafana CrashLoopBackOff
+
+After Loki was running, the node became unresponsive — kubectl commands timing out, SSH hanging:
+
+![kubectl TLS timeout](docs/screenshots/188-kubectl-tls-timeout.png)
+*Unable to connect to the server: net/http: TLS handshake timeout — k3s API server unresponsive*
+
+![Grafana loading slow](docs/screenshots/189-grafana-loading-slow.png)
+*Grafana dashboards loading but nodes not visible — node under severe memory pressure*
+
+![SSH resource check](docs/screenshots/190-ssh-resource-check.png)
+*SSH connection attempt — cursor hanging, no response. Node too loaded to accept connections.*
+
+The AWS spend had also triggered a budget alert at this point — a good reminder that resource waste has a real cost:
+
+![AWS budget alert](docs/screenshots/191-aws-budget-alert.png)
+*AWS budget alert — total spend ~€10 for the project. t3.medium instances running 24/7 add up.*
+
+**Resolution:** EC2 instance was stopped and started. On restart, the kubeconfig required a permission fix:
+
+![Kubeconfig permission error](docs/screenshots/192-kubeconfig-permission-error.png)
+*kubectl permission denied after restart — k3s regenerates kubeconfig with root-only permissions. Fix: chmod 644 /etc/rancher/k3s/k3s.yaml*
+
+With the node back up, Grafana was in CrashLoopBackOff:
+
+![Grafana crashloopbackoff](docs/screenshots/193-grafana-crashloopbackoff.png)
+*monitoring-grafana 2/3 CrashLoopBackOff with 8+ restarts — the pod causing the problem was also consuming resources in its restart cycle*
+
+The crash logs revealed the root cause:
+
+![Two isDefault true conflict](docs/screenshots/194-two-isdefault-conflict.png)
+*Two datasource ConfigMaps both with isDefault: true — loki-loki-stack (auto-created by chart) and Prometheus (from kube-prometheus-stack). Grafana refuses to start with two defaults.*
+
+**The loki-stack chart creates a datasource ConfigMap automatically** — even with `grafana.enabled: false` — so Grafana sidecars in external installations can pick it up. This ConfigMap sets Loki as `isDefault: true`, conflicting with Prometheus.
+
+**Fix Part 1:** Patch the ConfigMap immediately to unblock Grafana:
+
+![ConfigMap patch](docs/screenshots/195-configmap-patch.png)
+*sed replaces isDefault: true with isDefault: false in the ConfigMap, then kubectl apply patches it — Grafana can now start*
+
+**Fix Part 2:** Add `ignoreDifferences` to the ArgoCD loki Application to prevent ArgoCD from reverting the patch:
+
+![ArgoCD ignoreDifferences](docs/screenshots/196-argocd-ignoredifferences.png)
+*ignoreDifferences added to loki.yaml — ArgoCD will no longer flag the ConfigMap data as out-of-sync and revert our change*
+
+![Grafana 3/3 running](docs/screenshots/197-grafana-33-running.png)
+*monitoring-grafana 3/3 Running — CrashLoopBackOff resolved after ConfigMap patch and pod restart*
+
+---
+
+### Loki Working — Live Log Queries in Grafana Explore
+
+With Grafana running and both data sources configured, the label browser loaded:
+
+![Loki label browser](docs/screenshots/198-loki-label-browser.png)
+*Grafana Explore → Loki → Label browser showing namespace, pod, container, app labels — Loki has data*
+
+![Loki log volume error](docs/screenshots/199-loki-log-volume-error.png)
+*Minor: "Failed to load log volume" — Grafana/Loki version compatibility issue with the histogram chart. Actual log lines unaffected.*
+
+![Loki logs working](docs/screenshots/200-loki-logs-working.png)
+*Live structured JSON logs from all 12 Online Boutique services — checkout events, currency conversions, recommendations streaming in real time*
+
+To confirm end-to-end: a purchase was made on the boutique while watching Loki live:
+
+![Boutique URL timestamp](docs/screenshots/201-boutique-url-timestamp.png)
+*Online Boutique at http://63.184.235.88 — timestamp visible for correlating with Loki logs*
+
+![Boutique live timestamp](docs/screenshots/202-boutique-live-timestamp.png)
+*Shopping session in progress — timestamp used to pinpoint exact log entries in Loki*
+
+![Boutique product check](docs/screenshots/203-boutique-product-check.png)
+*Product browsed on the boutique — every click generates logs across frontend, recommendation, currency, cart services*
+
+![Loki live logs](docs/screenshots/204-loki-live-logs.png)
+*Loki Explore — live log stream showing the exact request path through multiple services for the product browse action*
+
+The query `{namespace="online-boutique"}` returns logs from all 12 pods simultaneously. Each service logs in its own format — frontend in Go JSON, currencyservice in Node.js JSON, recommendationservice in Python — Loki stores them all without any pre-processing.
+
+---
+
+### Why This Matters
+
+The full observability stack is now operational:
+
+| Pillar | Tool | Status |
+|--------|------|--------|
+| Metrics | Prometheus + Grafana | ✅ Live — dashboards, resource tracking |
+| Logs | Loki + Promtail | ✅ Live — structured logs from all 12 services |
+| Traces | (future — Jaeger/Tempo) | Phase 6 |
+
+In production, this combination means an engineer can go from "something is slow" → check Grafana metrics for which pod is spiking → check Loki logs for that pod in the same time window → identify the exact request and error. Without both layers, the investigation starts blind.
 
 ---
 
