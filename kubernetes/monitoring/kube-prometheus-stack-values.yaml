@@ -46,8 +46,108 @@ prometheus:
     podMonitorSelectorNilUsesHelmValues: false
 
 alertmanager:
-  # Disable for now — Phase 5 will add alert rules
-  enabled: false
+  enabled: true
+
+  # Expose AlertManager UI on NodePort 30031
+  service:
+    type: NodePort
+    nodePort: 30031
+
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 50m
+      memory: 64Mi
+
+  # Mount the Gmail app password secret into the AlertManager pod
+  alertmanagerSpec:
+    secrets:
+      - alertmanager-smtp-secret
+
+  config:
+    global:
+      # Gmail SMTP — requires an App Password (not your Google login password)
+      smtp_smarthost: 'smtp.gmail.com:587'
+      smtp_from: 'riungudenis63@gmail.com'
+      smtp_auth_username: 'riungudenis63@gmail.com'
+      # Password read from mounted secret — never stored in Git
+      smtp_auth_password_file: /etc/alertmanager/secrets/alertmanager-smtp-secret/gmail-password
+      smtp_require_tls: true
+
+    route:
+      group_by: ['alertname', 'namespace']
+      group_wait: 30s        # wait 30s before sending first alert (group similar alerts)
+      group_interval: 5m     # wait 5m before sending new alerts for same group
+      repeat_interval: 4h    # re-send if still firing after 4h
+      receiver: 'gmail'
+
+    receivers:
+      - name: 'gmail'
+        email_configs:
+          - to: 'riungudenis63@gmail.com'
+            send_resolved: true   # also email when alert clears
+
+# Alert rules for this cluster
+# PrometheusRule CRDs picked up automatically by the Prometheus Operator
+additionalPrometheusRulesMap:
+  cloudcommerce-alerts:
+    groups:
+
+      - name: pod.rules
+        rules:
+          # Pod has restarted more than 5 times in 15 minutes — CrashLoopBackOff pattern
+          - alert: PodCrashLooping
+            expr: rate(kube_pod_container_status_restarts_total[15m]) * 60 * 15 > 5
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Pod {{ $labels.pod }} is crash looping"
+              description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} has restarted more than 5 times in 15 minutes. Check logs immediately."
+
+          # Pod has been in Failed or Unknown state for 5+ minutes
+          - alert: PodNotRunning
+            expr: kube_pod_status_phase{phase=~"Failed|Unknown",namespace!="kube-system"} > 0
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Pod {{ $labels.pod }} stuck in {{ $labels.phase }}"
+              description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} has been in {{ $labels.phase }} state for more than 5 minutes."
+
+          # Pod has been Pending for 10+ minutes — scheduling failure or resource exhaustion
+          - alert: PodStuckPending
+            expr: kube_pod_status_phase{phase="Pending",namespace!="kube-system"} > 0
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Pod {{ $labels.pod }} stuck Pending"
+              description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} has been Pending for over 10 minutes. Node may be out of resources."
+
+      - name: node.rules
+        rules:
+          # Node memory above 90% — warning, monitor closely
+          - alert: HighNodeMemoryUsage
+            expr: (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes > 0.90
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Node memory above 90%"
+              description: "Node {{ $labels.instance }} memory is at {{ $value | humanizePercentage }}. OOM risk if it continues rising."
+
+          # Node memory above 95% — critical, OOM kills imminent
+          - alert: CriticalNodeMemoryUsage
+            expr: (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes > 0.95
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Node memory above 95% — OOM imminent"
+              description: "Node {{ $labels.instance }} memory is at {{ $value | humanizePercentage }}. Pods will start being evicted."
 
 kube-state-metrics:
   resources:

@@ -210,6 +210,14 @@ resource "aws_security_group" "k3s" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  ingress {
+    description = "AlertManager UI"
+    from_port   = 30031
+    to_port     = 30031
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
