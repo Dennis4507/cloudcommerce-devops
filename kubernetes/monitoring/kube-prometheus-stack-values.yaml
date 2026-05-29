@@ -70,8 +70,8 @@ alertmanager:
     global:
       # Gmail SMTP — requires an App Password (not your Google login password)
       smtp_smarthost: 'smtp.gmail.com:587'
-      smtp_from: 'riungudenis63@gmail.com'
-      smtp_auth_username: 'riungudenis63@gmail.com'
+      smtp_from: 'herikoug@gmail.com'
+      smtp_auth_username: 'herikoug@gmail.com'
       # Password read from mounted secret — never stored in Git
       smtp_auth_password_file: /etc/alertmanager/secrets/alertmanager-smtp-secret/gmail-password
       smtp_require_tls: true
@@ -94,7 +94,7 @@ alertmanager:
       - name: 'null'
       - name: 'gmail'
         email_configs:
-          - to: 'riungudenis63@gmail.com'
+          - to: 'herikoug@gmail.com'
             send_resolved: true   # also email when alert clears
 
 # Alert rules for this cluster
