@@ -6,6 +6,9 @@ I assumed a crashing pod wasn't doing anything.
 
 I was wrong. And that assumption made everything worse.
 
+📸 `docs/screenshots/193-grafana-crashloopbackoff.png`
+*— Lead thumbnail. Grafana pod showing 2/3 CrashLoopBackOff with 8 restarts, other pods running fine around it. The contrast tells the story instantly — one bad pod in a sea of green.*
+
 I'm building a full DevOps platform on AWS — k3s Kubernetes, Jenkins CI/CD, ArgoCD GitOps, 12-microservice ecommerce app, Prometheus + Grafana + Loki + AlertManager observability stack. During setup, Grafana entered CrashLoopBackOff due to a datasource config conflict.
 
 I had other things to fix first. I left it.
@@ -26,10 +29,13 @@ When I looked at it clearly: the root cause of the node freezing wasn't memory a
 
 Fix the crash loop first. Before anything else.
 
+📸 `docs/screenshots/197-grafana-33-running.png`
+*— The resolution. 3/3 Running after fixing the config and patching the ConfigMap. Same pod. Clean slate.*
+
 But this raises a question I don't have a clean answer to:
 
-At what restart count should Kubernetes just... stop trying? Right now it keeps retrying indefinitely with exponential backoff — up to 5 minutes between attempts. Is that the right behaviour? Or should there be a hard limit after which the pod stays down until a human intervenes?
+At what restart count should Kubernetes just stop trying? Right now it keeps retrying indefinitely with exponential backoff — up to 5 minutes between attempts. Is that the right behaviour? Or should there be a hard limit after which the pod stays down until a human intervenes?
 
-I've seen arguments both ways. What's your take — should Kubernetes give up after N restarts, or keep trying forever?
+I've seen arguments both ways. What's your take?
 
 #DevOps #Kubernetes #AWS #SRE #LearningInPublic

@@ -12,17 +12,21 @@ But that's not how it works at all.
 
 Prometheus and AlertManager are two completely separate systems with a deliberate split of responsibility:
 
-**Prometheus** evaluates rules. Every 15 seconds it runs PromQL queries against its metrics. If a condition is true for long enough — say, a pod has restarted 5 times in 15 minutes — it marks the alert as Firing and sends it to AlertManager via HTTP. That's where Prometheus's job ends.
+**Prometheus** evaluates rules. Every 15 seconds it runs queries against its metrics. If a condition is true for long enough — say, a pod has restarted 5 times in 15 minutes — it marks the alert as Firing and sends it to AlertManager via HTTP. That's where Prometheus's job ends. It knows nothing about email, Slack or PagerDuty.
 
-**AlertManager** decides what to do with the alert. It applies routing rules, deduplicates, groups related alerts together, respects silences, enforces repeat intervals so you don't get spammed, and then sends the actual notification — email, Slack, PagerDuty, whatever you configured.
+**AlertManager** decides what to do with the alert. It applies routing rules, deduplicates, groups related alerts, respects silences, enforces repeat intervals so you don't get spammed, and sends the actual notification.
 
-Prometheus knows nothing about email. AlertManager knows nothing about metrics.
+📸 `docs/screenshots/220-alertmanager-status-config.png`
+*— Lead thumbnail. The AlertManager Status page showing the full config — Gmail SMTP wired in, routing tree visible, both receivers (gmail and null) configured. For technical people this is satisfying to see. For non-technical people the sheer amount of configuration tells the story.*
 
 The result: we received a `[RESOLVED]` email automatically when Grafana recovered from CrashLoopBackOff — without writing a single line of recovery logic. AlertManager handled it because `send_resolved: true` was in the receiver config.
 
+📸 `docs/screenshots/214-email-resolved-replicasmismatch.png`
+*— The actual email received. [RESOLVED] KubeDeploymentReplicasMismatch landing in Gmail. Real alert. Real inbox. Full pipeline confirmed.*
+
 But here's what I'm wondering:
 
-This two-system architecture adds complexity. You have to configure and operate both. Some newer tools (Grafana OnCall, for example) are collapsing this into a single system. Is the separation still worth it? Or is it historical baggage from when these tools were built?
+This two-system architecture adds complexity. You have to configure and operate both. Some newer tools are collapsing this into a single system. Is the separation still worth it? Or is it historical baggage?
 
 Experienced engineers — is there a real operational reason to keep them separate, or would you prefer one unified system?
 

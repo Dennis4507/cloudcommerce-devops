@@ -6,7 +6,10 @@ I configured the Kubernetes Service correctly.
 
 Grafana still wasn't accessible.
 
-I'm building a full DevOps platform on AWS — k3s Kubernetes, Jenkins CI/CD, ArgoCD GitOps, full observability stack on a 12-microservice ecommerce application. After deploying Grafana, I set up a NodePort Service on port 30030. All pods were Running. Everything looked fine.
+📸 `docs/screenshots/158-grafana-connection-timeout.png`
+*— Lead thumbnail. ERR_CONNECTION_TIMED_OUT in the browser despite everything looking correct in Kubernetes. A screenshot every developer has seen and dreaded. Non-technical people know this one too — "the website isn't loading."*
+
+I'm building a full DevOps platform on AWS — k3s Kubernetes, Jenkins CI/CD, ArgoCD GitOps, full observability stack on a 12-microservice ecommerce application. After deploying Grafana, I set up a NodePort Service on port 30030. All pods were Running. Everything looked fine in Kubernetes.
 
 Browser said: ERR_CONNECTION_TIMED_OUT.
 
@@ -24,12 +27,15 @@ Both must be open. If the Security Group is closed, traffic never reaches the EC
 
 I had the Kubernetes Service configured. I had the Terraform code written for the Security Group rule. But I hadn't run `terraform apply`. The rule existed in code but not in AWS.
 
+📸 `docs/screenshots/159-security-group-30030-added.png`
+*— The fix. AWS Security Group inbound rule added for port 30030. Two minutes in the console. Grafana loaded immediately after.*
+
 Two minutes in the AWS Console. Grafana loaded immediately.
 
-Here's what I'm curious about though:
+Here's what I'm curious about:
 
-Is manually adding Security Group rules in the console ever acceptable in a production environment? We had the Terraform code — we just hadn't applied it. Some teams treat the console as a valid "emergency escape hatch." Others treat any manual change as a policy violation.
+Is manually adding Security Group rules in the console ever acceptable in a production environment? We had the Terraform code — we just hadn't applied it. Some teams treat the console as a valid emergency escape hatch. Others treat any manual change as a policy violation.
 
-Where do you draw the line? Console for emergencies only? Never? Or does it depend on the team?
+Where do you draw the line?
 
 #DevOps #Kubernetes #AWS #Terraform #CloudEngineering #LearningInPublic
