@@ -1,39 +1,39 @@
-# Post 02 — CPU Requests vs Actual Usage
+# Post 02 — My Server Said It Was Full. It Was Also 88% Empty.
 
 ---
 
-My Kubernetes node said it was full.
+My server told me it had no room for anything new.
 
-It was also only 12% busy.
+It was also barely doing any work.
 
-Both of those statements were true at the same time.
+Both were true at the same time.
 
 📸 `docs/screenshots/162-grafana-cluster-resources.png`
-*— Lead thumbnail. The Grafana dashboard showing 99.5% CPU reserved vs 12% actual usage side by side. The contradiction is visible before anyone reads a word. Technical people will immediately know the problem. Non-technical people will stare at it and want to understand.*
+*— Lead thumbnail. The dashboard showing 99.5% reserved but only 12% actually being used. The contradiction is visible before anyone reads a word.*
 
-I'm building a full DevOps platform on AWS — k3s Kubernetes, Jenkins CI/CD, ArgoCD GitOps, Prometheus + Grafana monitoring, running a 12-microservice ecommerce application. When I installed the monitoring stack and checked Grafana for the first time, this is what I saw:
+I'm building a full ecommerce platform on AWS — running 12 separate services, monitoring tools, automated deployments, all on cloud servers I'm paying for myself.
 
-**CPU requests committed: 99.5%**
-**CPU actual utilisation: 12%**
+When I checked the server dashboard for the first time, I saw this:
 
-No new pods could be scheduled. The node was "full." But 88% of its actual CPU was sitting idle.
+**Space reserved: 99.5%**
+**Space actually being used: 12%**
 
-Here's what was happening:
+No new services could be added. The server was "full." But it was sitting there doing almost nothing.
 
-Every pod has two CPU settings — `requests` and `limits`. Kubernetes uses `requests` for scheduling decisions. When you ask to schedule a new pod, Kubernetes looks at what's been *reserved*, not what's being *used*. Our pods had reserved nearly all available CPU defensively — but at idle, were barely touching it.
+Here's what was happening — and this is something that catches a lot of people out:
 
-The real problem wasn't CPU at all. It was accounting.
+In the world of cloud servers, there's a difference between **reserving** space and **using** space.
 
-A pod with no CPU request gets scheduled as BestEffort — it can land on a "full" node because it made no reservation. A pod with a 50m request cannot — even if the node is barely busy.
+Think of it like a restaurant. If every table has a "Reserved" sign on it, the restaurant looks full — even if half those reserved tables are empty all evening. New customers get turned away. But the restaurant is barely busy.
 
-The fix was one line. Setting `cpu: null` in the Helm values — explicitly removing the chart default. Not omitting it, not setting it to zero. `null`. Because in Helm, omitting a key leaves the chart default in place. `null` is the only way to delete it.
+My server worked the same way. Each service had reserved far more space than it actually needed. So the server thought it was full — and refused to add anything new — even though most of that reserved space was sitting unused.
 
-The node scheduler suddenly had room again.
+The fix was a single line of code — telling certain services to stop reserving space they weren't using. The server immediately had room again.
 
-But here's what I'm still thinking about:
+But here's the question I'm still thinking about:
 
-Is aggressive CPU requesting actually the *right* default for most Kubernetes workloads? Or are we all just padding our reservations and wondering why our nodes fill up before they're busy?
+Is this a design problem? Should servers be smarter about the difference between reserved and actually used? Or is reserving space defensively actually the right approach — and engineers just need to be more disciplined about how much they reserve?
 
-How do your teams handle resource requests in production — based on profiling, estimation, or something else entirely?
+What do you think?
 
-#DevOps #Kubernetes #AWS #CloudEngineering #LearningInPublic
+#DevOps #AWS #CloudEngineering #LearningInPublic #Tech

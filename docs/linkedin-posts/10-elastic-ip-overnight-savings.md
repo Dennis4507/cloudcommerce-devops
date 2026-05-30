@@ -1,41 +1,40 @@
-# Post 10 — I Stop My AWS Servers Every Night. This One Decision Made That Possible.
+# Post 10 — I Turn My Cloud Servers Off Every Night. One Small Decision Makes That Possible.
 
 ---
 
-Running servers 24/7 in AWS when you're learning and building costs money you don't need to spend.
+Running cloud servers 24 hours a day, 7 days a week costs money.
 
-I stop my EC2 instances every night. Start them in the morning when I need them.
+When you're building something yourself, on your own budget, that adds up fast.
 
-One thing made this practical: Elastic IP.
+I turn mine off every evening. Start them again in the morning.
+
+One decision made that practical.
 
 📸 `docs/screenshots/07-elastic-ips.png`
-*— Lead thumbnail. The AWS console showing the Elastic IPs attached to our instances — same IPs every time, regardless of how many times the instances have been stopped and started. Simple screenshot, but it represents a real cost and operational decision.*
+*— Lead thumbnail. The AWS console showing fixed IP addresses attached to the servers — same addresses every morning, no matter how many times they've been switched off.*
 
-I'm building a full DevOps portfolio on AWS — completely self-funded. k3s Kubernetes, Jenkins CI/CD, ArgoCD GitOps, Prometheus, Grafana, Loki, AlertManager, 12-microservice ecommerce application. Two EC2 t3.medium instances running the whole platform.
+I'm building a full ecommerce platform on AWS — completely self-funded. Every euro matters.
 
-When you stop and start an EC2 instance, AWS assigns it a new public IP address by default. For a learning project where nothing is running in production, this would mean:
+Cloud servers in AWS come with a problem: every time you switch them off and back on, they get a new address on the internet. Like a phone that gets a new phone number every time you restart it.
 
-- Updating GitHub webhook URLs every morning (Jenkins)
-- Updating any hardcoded IP references in configs
-- Re-connecting tools that remembered the old IP
-- Confusion when something "stops working" and the actual cause is an IP change
+If your address keeps changing, everything that connects to your server has to be updated every morning. The tools that send updates to your server. The automated systems pointing at it. Every connection that relies on knowing where to find you.
 
-An Elastic IP is a static public IP address that stays attached to your instance through stop/start cycles. Same IP every morning. No config changes. No webhook updates. No debugging phantom IP issues.
+That's not practical for daily use.
 
-Cost: free when attached to a running instance. About €3.65/month when the instance is stopped but the IP is reserved.
+The solution is called an **Elastic IP** — a fixed internet address that stays attached to your server no matter how many times you switch it off and on. Same address every morning. Nothing needs to be updated.
 
-The alternative — leaving instances running 24/7 — costs roughly €60/month for two t3.mediums. Stopping them overnight (say 16 hours of work time out of 24) cuts that by a third.
+Cost: about €3.50 per month. The alternative — leaving servers running overnight — costs around €60 per month for the setup I have.
 
-Over the course of building this project: meaningful savings for a self-funded portfolio. For a company leaving dev environments running overnight across a team of 10 engineers — multiply that and ask who's actually watching the bill.
+Switching them off when I'm not working cuts that significantly. Over the course of building this project, that's a real saving.
 
-This is also why I stopped and started the instance to recover from node memory exhaustion rather than just rebooting — same IP, everything comes back, ArgoCD re-syncs from Git automatically.
+It also means the "switch off at night" habit is only possible because of this one small decision made at the beginning. Without it, the daily overhead of updating everything that connects to the server would make switching off more trouble than it's worth.
 
-One small infrastructure decision. Surprisingly large operational impact.
+Small infrastructure decisions have long-term operational consequences. This is one I got right early.
 
-But here's the question I keep coming back to:
+But here's what I'm curious about:
 
-In your organisation, who owns the AWS bill? Is there actually someone checking whether dev environments are running overnight? Or does it just silently accumulate until someone notices the invoice?
+In larger companies, does anyone actually track whether development servers are running overnight? Or does the cost just quietly accumulate on the bill until someone notices?
 
-I'm curious how mature teams handle this — FinOps policies, automated shutdowns, something else entirely?
+How does your organisation handle it?
 
-#DevOps #AWS #CloudEngineering #FinOps #LearningInPublic #CloudCosts
+#DevOps #AWS #CloudEngineering #FinOps #LearningInPublic #Tech #CloudCosts

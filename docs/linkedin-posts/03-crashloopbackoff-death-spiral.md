@@ -1,41 +1,44 @@
-# Post 03 — CrashLoopBackOff Death Spiral
+# Post 03 — I Left a Broken Tool Running. It Quietly Made Everything Worse.
 
 ---
 
-I assumed a crashing pod wasn't doing anything.
+One of my monitoring tools was broken and kept crashing.
 
-I was wrong. And that assumption made everything worse.
+I knew about it. I left it. I had other things to fix first.
+
+That was a mistake.
 
 📸 `docs/screenshots/193-grafana-crashloopbackoff.png`
-*— Lead thumbnail. Grafana pod showing 2/3 CrashLoopBackOff with 8 restarts, other pods running fine around it. The contrast tells the story instantly — one bad pod in a sea of green.*
+*— Lead thumbnail. The dashboard showing one tool crashing repeatedly while everything else runs fine. That one bad row in a sea of green.*
 
-I'm building a full DevOps platform on AWS — k3s Kubernetes, Jenkins CI/CD, ArgoCD GitOps, 12-microservice ecommerce app, Prometheus + Grafana + Loki + AlertManager observability stack. During setup, Grafana entered CrashLoopBackOff due to a datasource config conflict.
+I'm building a full ecommerce platform on AWS — 12 services, automated pipelines, real-time monitoring, all self-funded and built from scratch.
 
-I had other things to fix first. I left it.
+When my monitoring dashboard (Grafana) broke, I assumed it was just sitting there quietly, broken but harmless — like a smoke alarm with a dead battery. Annoying, but not making things worse.
 
-Here's what I didn't realise:
+I was wrong.
 
-A pod in CrashLoopBackOff is not idle. Kubernetes restarts it every 60-90 seconds. Every restart cycle:
-- Pulls container layers (CPU + network)
-- Initialises the process until it crashes
-- Reports the crash to the API server
-- Waits for backoff, then repeats
+Every 90 seconds, the broken tool tried to restart itself. Each restart:
+- Consumed memory and processing power
+- Put more pressure on an already struggling server
+- Made the exact problem I was trying to fix worse
 
-Grafana crashed 8+ times while I was working on other fixes. Each crash consumed CPU and memory. The monitoring stack — the thing supposed to be watching the cluster — was actively worsening the memory pressure it was meant to observe.
+The monitoring tool that was supposed to be watching the system was draining the system it was supposed to protect.
 
-The node froze. kubectl timed out. SSH hung. I had to reboot the EC2 instance.
+Eventually the whole server froze. Nothing responded. I had to do a full restart.
 
-When I looked at it clearly: the root cause of the node freezing wasn't memory alone. It was a crashing pod amplifying a memory problem that was already there.
+When I looked back at what happened, the sequence was clear:
 
-Fix the crash loop first. Before anything else.
+Broken tool → keeps restarting → uses up resources → server runs out of memory → everything stops → full restart required.
+
+The broken tool was the domino that knocked everything else over.
 
 📸 `docs/screenshots/197-grafana-33-running.png`
-*— The resolution. 3/3 Running after fixing the config and patching the ConfigMap. Same pod. Clean slate.*
+*— After the fix. The same tool, now running properly. Three green lights where there were red ones.*
 
-But this raises a question I don't have a clean answer to:
+**Fix the broken thing first.** Before anything else. A broken tool is never just sitting there — it's always doing something, and usually that something is making your situation worse.
 
-At what restart count should Kubernetes just stop trying? Right now it keeps retrying indefinitely with exponential backoff — up to 5 minutes between attempts. Is that the right behaviour? Or should there be a hard limit after which the pod stays down until a human intervenes?
+This makes me wonder — should systems automatically shut down a tool that keeps failing, rather than keep restarting it forever?
 
 I've seen arguments both ways. What's your take?
 
-#DevOps #Kubernetes #AWS #SRE #LearningInPublic
+#DevOps #AWS #SRE #LearningInPublic #Tech #CloudEngineering

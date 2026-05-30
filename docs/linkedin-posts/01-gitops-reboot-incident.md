@@ -1,43 +1,43 @@
 # "Have you tried turning it off and on again?"
 
-*Phase 4 incident — Kubernetes node memory exhaustion, CrashLoopBackOff death spiral, and why GitOps made the oldest IT fix in the book actually work.*
-
 ---
 
-Yesterday my Kubernetes node was completely unresponsive. kubectl timing out. SSH hanging. The whole cluster frozen.
+My server completely stopped responding.
+
+Nothing worked. The website was still up, but I couldn't connect to manage it. Every command timed out. It was like knocking on a door that nobody was answering.
 
 📸 `docs/screenshots/188-kubectl-tls-timeout.png`
-*— Use this as the lead thumbnail. "Unable to connect to the server: TLS handshake timeout" on repeat. Instantly recognisable to any engineer who's been here.*
+*— Lead thumbnail. The error screen showing the server not responding. Anyone who manages servers has seen something like this.*
 
-So I did the oldest IT fix in the book — I stopped the EC2 instance and started it again.
+So I did what IT people have done since computers existed — I turned it off and turned it back on again.
 
-But here's what made it work, and what I think most people miss:
+But here's the part most people miss:
 
-**The reboot didn't fix anything. GitOps did.**
+**The reboot didn't fix anything. The way I'd set things up did.**
 
-When the node came back up, I didn't have to:
-- Manually restart 19 pods
-- Reconfigure Prometheus
-- Reinstall ArgoCD
-- Redeploy 12 microservices
+When the server came back on, I didn't have to:
+- Manually restart 19 separate services
+- Reconfigure the monitoring tools
+- Redeploy the entire ecommerce application
+- Reconnect anything
 
-Everything came back automatically. ArgoCD pulled from Git and reconciled the entire cluster state in minutes. Because in a GitOps system, nothing lives on the node permanently. The node is cattle, not a pet. The truth lives in Git.
+Everything came back on its own. Automatically. In minutes.
 
-A traditional server reboot is an incident. A GitOps cluster reboot is just a brief interruption.
+Why? Because I'd built the system using a method called GitOps — where every instruction for how the system should look is stored in Git (think of Git as a permanent instruction manual that lives in the cloud). When the server restarted, it simply read those instructions and rebuilt itself.
 
-**What I also learned about CrashLoopBackOff:**
+Think of it like this: a traditional server is like a sandcastle — if a wave hits it, you rebuild it from memory. A GitOps server is like a sandcastle with a blueprint — the wave hits, you just follow the blueprint again.
 
-A pod in CrashLoopBackOff is not idle. It restarts every ~90 seconds — consuming CPU and memory on every attempt. Grafana was crashing due to a datasource config conflict, and that crash loop was actively making the memory pressure worse. The cluster was struggling partly because of the very pod that was supposed to be helping monitor it.
+**One more thing I learned the hard way:**
 
-Fixing the config bug was as important as the reboot itself.
+One of my monitoring tools was crashing and restarting every 90 seconds. I assumed a crashed tool wasn't doing any harm — like a broken alarm clock just sitting there.
 
-**The production-correct approach** would have been to drain the node — migrate all pods to healthy nodes with zero downtime — fix the root cause, then bring it back into rotation. On a single-node portfolio cluster, stop/start is the equivalent.
+Wrong. Every restart was consuming power and resources. The tool that was supposed to be watching the system was actually making the problem worse. Like a car alarm that drains the battery it's supposed to protect.
 
-Understanding *why* the simple fix works is what separates a junior who reboots and hopes from an engineer who reboots and knows exactly what's about to happen.
+Fixing that was just as important as the reboot.
 
 📸 `docs/screenshots/216-all-pods-running-alertmanager.png`
-*— End with this. Everything green. All 8 monitoring pods Running after the reboot. The payoff.*
+*— Everything back online after the reboot. Green across the board.*
 
-Building a full DevOps portfolio on AWS — k3s, Jenkins, ArgoCD, Terraform, Prometheus, Grafana, Loki, AlertManager. This was Phase 4.
+Building a full DevOps ecommerce platform on AWS — fully self-funded, learning in public.
 
-#DevOps #Kubernetes #GitOps #AWS #CloudEngineering #LearningInPublic
+#DevOps #Kubernetes #AWS #LearningInPublic #CloudEngineering #Tech

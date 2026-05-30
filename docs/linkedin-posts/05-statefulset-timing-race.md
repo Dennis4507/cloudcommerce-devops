@@ -1,39 +1,47 @@
-# Post 05 — The StatefulSet That Wouldn't Update
+# Post 05 — I Fixed It. It Broke Again. I Fixed It Again. Same Result.
 
 ---
 
-I deleted the pod. It came back wrong.
+I made a change.
 
-I deleted it again. Still wrong.
+It didn't take effect.
+
+I made the change again. Still nothing.
+
+For 45 minutes I was convinced the system was ignoring me.
 
 📸 `docs/screenshots/178-pod-spec-check-cpu50m.png`
-*— Lead thumbnail. The kubectl output showing the pod spec still has cpu:50m even after we changed the config and ArgoCD synced. The template said one thing. The pod said another. This is the moment of genuine confusion — "I changed it, why isn't it changing?"*
+*— Lead thumbnail. The terminal output showing the old setting still in place after we'd already changed it. The system was supposed to update. It hadn't.*
 
-I'm building a full DevOps platform on AWS — k3s Kubernetes, ArgoCD GitOps, Jenkins CI/CD, full observability stack on a 12-microservice ecommerce application. We were deploying Loki for log aggregation. The pod was Pending because the node had no CPU headroom. We fixed the CPU request in the Helm values, pushed to Git, ArgoCD synced.
+I'm building a full ecommerce platform on AWS — self-funded, learning in public.
 
-The StatefulSet template updated correctly. I could see it.
+I needed to change a setting on one of my services. The service wasn't starting because it was asking for more server resources than were available.
 
-The pod still had the old CPU request. I could see that too.
+I changed the setting. Saved it. The system updated — I could see the update had been applied.
 
-Here's what was happening:
+The service still used the old setting.
 
-StatefulSet rolling updates only apply to **Running** pods. The Loki pod was Pending — not Running. The StatefulSet controller looked at it and said: "I'll update you when you're Running." It never ran. So it was never updated.
+I deleted the service and restarted it, thinking a fresh start would pick up the new setting.
 
-When I deleted the pod to force a fresh start, Kubernetes recreated it faster than ArgoCD could finish applying the updated template. The new pod grabbed the old spec.
+The service came back with the old setting again.
 
-I deleted it again. Same race. Same result.
+Here's what was happening beneath the surface:
 
-The fix wasn't deleting the pod. It was deleting the entire StatefulSet. ArgoCD detected the drift, waited for its next sync, and recreated the StatefulSet from scratch with the current Git state. Fresh template. Pod scheduled. Running.
+The system that manages restarts (called a StatefulSet — think of it as a supervisor that keeps services running) had a rule: only update a service that is currently working. If a service is stuck — not running yet — the supervisor skips it and waits.
+
+My service was stuck waiting for resources. So the supervisor never updated it. And every time I deleted and restarted it, the restart happened so fast that it grabbed the old settings before my update had a chance to be applied.
+
+It was a race. And I kept losing it.
+
+The fix was counterintuitive: instead of restarting the service, I had to shut down the entire supervisor — the thing managing the service — and let the system rebuild it from scratch. That gave the update time to be applied before anything restarted.
+
+📸 `docs/screenshots/176-kubectl-get-pods-monitoring-w.png`
+*— Finally. The service coming up correctly after the supervisor was rebuilt from scratch.*
 
 3 minutes of waiting instead of 45 minutes of fighting.
 
-📸 `docs/screenshots/176-kubectl-get-pods-monitoring-w.png`
-*— After the StatefulSet delete. Watching pods come back — loki-0 finally moves from Pending to Running with the correct spec.*
+The lesson: sometimes the solution isn't to try harder at the same thing. It's to step back and remove what's in the way.
 
-What I'm still thinking about:
+Has this ever happened to you — working harder at something, only to realise the approach itself was the problem?
 
-Is this a design flaw in how StatefulSets handle updates for non-Running pods? Or is it correct behaviour — and the real lesson is that a Pending pod signals a deeper problem that should be fixed before touching the template?
-
-Have you hit this? How did you handle it?
-
-#DevOps #Kubernetes #GitOps #ArgoCD #LearningInPublic
+#DevOps #AWS #Kubernetes #LearningInPublic #Tech #CloudEngineering

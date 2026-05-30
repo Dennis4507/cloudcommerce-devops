@@ -1,41 +1,45 @@
-# Post 04 — The Two Firewalls Nobody Explains
+# Post 04 — I Did Everything Right. The Website Still Wouldn't Load.
 
 ---
 
-I configured the Kubernetes Service correctly.
+I set everything up correctly on my end.
 
-Grafana still wasn't accessible.
+The website still wouldn't open.
 
 📸 `docs/screenshots/158-grafana-connection-timeout.png`
-*— Lead thumbnail. ERR_CONNECTION_TIMED_OUT in the browser despite everything looking correct in Kubernetes. A screenshot every developer has seen and dreaded. Non-technical people know this one too — "the website isn't loading."*
+*— Lead thumbnail. The browser showing "This site can't be reached." Familiar to everyone — technical or not.*
 
-I'm building a full DevOps platform on AWS — k3s Kubernetes, Jenkins CI/CD, ArgoCD GitOps, full observability stack on a 12-microservice ecommerce application. After deploying Grafana, I set up a NodePort Service on port 30030. All pods were Running. Everything looked fine in Kubernetes.
+I'm building a full ecommerce platform on AWS — 12 services, monitoring dashboards, automated deployments. All running on cloud infrastructure.
 
-Browser said: ERR_CONNECTION_TIMED_OUT.
+I deployed my monitoring dashboard. Checked that it was running. Checked the settings. Everything looked right.
 
-I spent time checking the Kubernetes Service. It was correct. I checked the pod. It was healthy. I checked the logs. No errors.
+Opened the browser. Connection timed out.
 
-The problem was somewhere I wasn't looking.
+I spent time checking my own setup. Everything was correct. The service was running. The settings were fine.
 
-When you deploy on AWS, traffic to your application passes through two completely separate access control layers:
+The problem was somewhere completely different — somewhere I hadn't thought to look.
 
-**Layer 1 — AWS Security Group:** Controls what traffic can reach your EC2 instance from the internet. Managed in AWS. Has nothing to do with Kubernetes.
+Here's the thing about cloud infrastructure that nobody explains clearly at the start:
 
-**Layer 2 — Kubernetes Service:** Controls how traffic is routed from the EC2 host port to the pod. Managed in Kubernetes. Has nothing to do with AWS.
+**There are two separate security layers between the internet and your application. Both have to be open.**
 
-Both must be open. If the Security Group is closed, traffic never reaches the EC2 instance — Kubernetes never even sees the request. You can have a perfect Kubernetes configuration and still get a timeout.
+Think of it like an office building:
+- The **AWS security group** is the building's front door — controlled by Amazon. It decides what traffic is even allowed to reach the building.
+- The **application service** is your office door — controlled by you. It decides who inside the building can get to your desk.
 
-I had the Kubernetes Service configured. I had the Terraform code written for the Security Group rule. But I hadn't run `terraform apply`. The rule existed in code but not in AWS.
+I had my office door open. But the building's front door was still locked.
+
+It didn't matter how perfectly I'd set up my side — traffic never even got to the building.
 
 📸 `docs/screenshots/159-security-group-30030-added.png`
-*— The fix. AWS Security Group inbound rule added for port 30030. Two minutes in the console. Grafana loaded immediately after.*
+*— The fix. Opening the front door. Two minutes in the AWS settings. Dashboard loaded immediately.*
 
-Two minutes in the AWS Console. Grafana loaded immediately.
+Two minutes to add one rule in the AWS console. Dashboard loaded immediately.
 
-Here's what I'm curious about:
+The code for that rule was already written — I just hadn't activated it yet. The instructions existed. The action hadn't been taken.
 
-Is manually adding Security Group rules in the console ever acceptable in a production environment? We had the Terraform code — we just hadn't applied it. Some teams treat the console as a valid emergency escape hatch. Others treat any manual change as a policy violation.
+This raises a question I'm genuinely curious about:
 
-Where do you draw the line?
+In your company, when a developer makes a manual change to fix something in production — is that acceptable? Or is every change supposed to go through a formal process, no exceptions?
 
-#DevOps #Kubernetes #AWS #Terraform #CloudEngineering #LearningInPublic
+#DevOps #AWS #CloudEngineering #LearningInPublic #Tech

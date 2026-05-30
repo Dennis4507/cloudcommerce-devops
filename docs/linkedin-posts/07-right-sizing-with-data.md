@@ -1,35 +1,40 @@
-# Post 07 — I Didn't Guess My Cluster Needed More Memory. Prometheus Told Me.
+# Post 07 — The Dashboard Told Me I Needed a Bigger Server. Before It Became a Problem.
 
 ---
 
-Most people resize infrastructure when something breaks.
+I didn't guess my server needed upgrading.
 
-I resized before it broke — because the data told me to.
+The data told me. Weeks before it became a crisis.
 
 📸 `docs/screenshots/162-grafana-cluster-resources.png`
-*— Lead thumbnail. The Grafana cluster overview showing 87.4% actual memory usage at idle — before any real traffic, before load testing, before anything stressful. The number speaks for itself. Anyone who's managed servers knows 87% at idle is a problem waiting to happen.*
+*— Lead thumbnail. The dashboard showing 87% memory used — at rest, before any real traffic. The number that started the conversation.*
 
-I'm building a full DevOps platform on AWS — k3s Kubernetes, Jenkins CI/CD, ArgoCD GitOps, Prometheus + Grafana + Loki + AlertManager on a 12-microservice ecommerce application. The cluster ran on a t3.medium (2 vCPU, 4GB RAM).
+I'm building a full ecommerce platform on AWS — 12 services, monitoring, automated pipelines, all self-funded.
 
-After deploying the full monitoring stack, Grafana showed me:
+After setting up the monitoring dashboards, the first thing they showed me was this:
 
-**Node memory actual usage: 87.4%**
-**Monitoring namespace: using 135% of its own requested memory**
+**87% of memory used — at idle.**
 
-87% at idle. Before any real traffic.
+Not under load. Not during a busy period. Just... sitting there, doing nothing much, already at 87%.
 
-I also had a custom AlertManager rule firing at 90% — `HighNodeMemoryUsage`. It was going to fire within days just from normal operation. And it did — twice. Both times the node froze completely. kubectl timed out. SSH hung. Full reboot required.
+In any system — servers, warehouses, office buildings — being at 87% capacity at your quietest moment is a warning. It means one busy spell, one unexpected spike, and you're over the limit.
 
-The monitoring data wasn't just telling me the cluster was busy. It was telling me the cluster had no headroom for anything unexpected. And in production, unexpected is the baseline.
+And that's exactly what happened. Twice.
 
-We're upgrading to t3.large — 8GB RAM. Not because something catastrophically failed. Because the metrics showed the trajectory clearly before it became a crisis.
+The server froze. Everything stopped responding. I had to do a full restart both times.
 
-That's what observability is actually for. Not dashboards for their own sake. Not pretty graphs in a presentation. It's the data that lets you make infrastructure decisions before users feel the consequences.
+The difference between our situation and most: I could see it coming. The dashboard was showing me the trend. I knew the server was running out of headroom — I just hadn't acted on it fast enough.
 
-But I want to push back on myself here:
+We upgraded to a larger server. Double the memory. The data made the decision, not a guess.
 
-Should I have sized correctly from the start? Is "deploy small, scale when the data says so" actually a good strategy — or is it just a way of creating avoidable incidents while you wait for the metrics to catch up?
+That's what monitoring tools are actually for. Not pretty graphs on a screen. Not something to set up and forget. They're the early warning system that lets you make decisions before your users feel the consequences.
 
-"Start small" vs "over-provision and avoid the drama." What's the right default?
+A mechanic doesn't wait for the engine to fail before checking the oil. Same principle.
 
-#DevOps #Kubernetes #AWS #Observability #CloudEngineering #LearningInPublic
+But here's the question that's been on my mind:
+
+Should I have sized the server correctly from the start? Is "start small, watch the data, then upgrade" actually smart — or is it just creating problems on purpose and calling it a learning experience?
+
+I genuinely don't know the right answer. What's your view?
+
+#DevOps #AWS #CloudEngineering #LearningInPublic #Tech #Observability
