@@ -1,0 +1,25 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring-extras
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    # Deploy raw manifests from our Git repo — ClusterSecretStore + ExternalSecrets
+    repoURL: https://github.com/Dennis4507/cloudcommerce-devops.git
+    targetRevision: main
+    path: kubernetes/monitoring/extras
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false
+      - ServerSideApply=true

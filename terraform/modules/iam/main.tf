@@ -109,3 +109,30 @@ resource "aws_iam_instance_profile" "k3s" {
   name = "${var.project}-${var.environment}-k3s-profile"
   role = aws_iam_role.k3s.name
 }
+
+# Allow k3s node to read secrets from AWS Secrets Manager
+# Used by External Secrets Operator to sync secrets into Kubernetes
+resource "aws_iam_policy" "k3s_secrets_manager" {
+  name        = "${var.project}-${var.environment}-k3s-secrets-policy"
+  description = "Allows k3s node to read secrets from AWS Secrets Manager"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret"
+        ]
+        # Scoped to our project secrets only — least privilege
+        Resource = "arn:aws:secretsmanager:eu-central-1:*:secret:cloudcommerce/*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "k3s_secrets_manager" {
+  role       = aws_iam_role.k3s.name
+  policy_arn = aws_iam_policy.k3s_secrets_manager.arn
+}
