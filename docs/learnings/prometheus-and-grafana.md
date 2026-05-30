@@ -13,13 +13,14 @@ Without observability tools, these questions require SSH access, manual log read
 
 ## The Three Pillars of Observability
 
-| Pillar | Tool | What it answers |
-|--------|------|-----------------|
-| Metrics | Prometheus + Grafana | What is the system doing right now and over time? |
-| Logs | Loki + Promtail | What exactly happened and when? |
-| Traces | Jaeger | Which service caused the slowdown in a chain of calls? |
+| Pillar | Tool | What it answers | Status |
+|--------|------|-----------------|--------|
+| Metrics | Prometheus + Grafana | What is the system doing right now and over time? | ✅ Phase 4 |
+| Logs | Loki + Promtail | What exactly happened and when? | ✅ Phase 4 |
+| Alerting | AlertManager + Gmail | Who gets notified when something goes wrong? | ✅ Phase 4 |
+| Traces | Jaeger / Tempo | Which service caused the slowdown in a chain of calls? | Phase 6 |
 
-This project covers metrics (Phase 4). Logs and traces are the next layers.
+See also: [[loki-and-promtail]] and [[alertmanager]] for the full observability stack documentation.
 
 ## What is Prometheus?
 
