@@ -2702,7 +2702,8 @@ git push (microservices-demo)
 - [x] AWS security group updated — port 30030 opened for Grafana access
 - [x] Loki + Promtail deployed via ArgoCD — full log aggregation from all 12 services
 - [x] Live log queries confirmed in Grafana Explore — structured JSON logs streaming
-- [ ] Configure AlertManager rules
+- [x] AlertManager deployed with Gmail SMTP — firing and resolved emails confirmed
+- [x] Custom alert rules — CrashLoopBackOff, PodStuckPending, HighMemory, CriticalMemory
 - [ ] Monitor HPA scaling events under k6 load
 
 ---
@@ -3036,6 +3037,145 @@ The full observability stack is now operational:
 | Traces | (future — Jaeger/Tempo) | Phase 6 |
 
 In production, this combination means an engineer can go from "something is slow" → check Grafana metrics for which pod is spiking → check Loki logs for that pod in the same time window → identify the exact request and error. Without both layers, the investigation starts blind.
+
+---
+
+### Alerting — AlertManager with Gmail SMTP
+
+The third observability pillar is alerting. Prometheus detects problems, AlertManager decides who to notify and how. They are deliberately separate — Prometheus knows nothing about email or Slack, AlertManager knows nothing about metrics.
+
+**Files updated:**
+- `kubernetes/monitoring/kube-prometheus-stack-values.yaml` — AlertManager enabled, Gmail SMTP config, custom PrometheusRules, NodePort 30031
+- `terraform/modules/ec2/main.tf` — port 30031 added to k3s security group
+- `kubernetes/argocd/loki.yaml` — `RespectIgnoreDifferences=true` added to prevent ConfigMap revert on sync
+
+**Secret (never in Git):**
+```bash
+kubectl create secret generic alertmanager-smtp-secret \
+  --from-literal=gmail-password='<app-password>' \
+  -n monitoring
+```
+
+![kubectl create alertmanager secret](docs/screenshots/205-kubectl-create-alertmanager-secret.png)
+*Kubernetes secret created directly on cluster — App Password never written to any file or committed to Git*
+
+---
+
+### Step 1 — Enable AlertManager and Configure Gmail
+
+AlertManager was previously disabled (`enabled: false`). Enabling it required:
+- Gmail App Password (generated in Google Account → Security → App Passwords)
+- SMTP config referencing the secret via file path (not plaintext)
+- NodePort 30031 for UI access
+- Custom alert rules for this cluster
+
+![AlertManager NodePort config](docs/screenshots/206-alertmanager-nodeport-config.png)
+*kube-prometheus-stack-values.yaml — AlertManager enabled, NodePort 30031, secret mounted via alertmanagerSpec.secrets*
+
+![AlertManager alert rules](docs/screenshots/207-alertmanager-alert-rules.png)
+*Custom PrometheusRule definitions — CrashLoopBackOff, PodNotRunning, PodStuckPending, HighNodeMemory, CriticalNodeMemory*
+
+Port 30031 also required an AWS security group inbound rule:
+
+![Security group port 30031](docs/screenshots/209-security-group-port-30031.png)
+*AWS EC2 Security Groups — Custom TCP port 30031 added for AlertManager UI*
+
+---
+
+### Challenge — `undefined receiver "null" used in route`
+
+The Prometheus Operator refused to create the AlertManager StatefulSet:
+
+```
+sync failed: provision alertmanager configuration:
+failed to initialize from secret: undefined receiver "null" used in route
+```
+
+**Root cause:** The kube-prometheus-stack chart's default config includes a `Watchdog` heartbeat alert routed to a receiver named `null`. When we provided our own `alertmanager.config`, we replaced the default but didn't include the `null` receiver definition. The Operator validates the config strictly — a route cannot reference a receiver that doesn't exist.
+
+**Fix:** Add a `null` receiver (standard AlertManager pattern — accepts and silently discards alerts) and route `Watchdog` and `InfoInhibitor` to it:
+
+```yaml
+route:
+  receiver: 'gmail'
+  routes:
+    - receiver: 'null'
+      matchers:
+        - alertname =~ "Watchdog|InfoInhibitor"
+
+receivers:
+  - name: 'null'        # discards alerts — no notification sent
+  - name: 'gmail'
+    email_configs:
+      - to: 'herikoug@gmail.com'
+        send_resolved: true
+```
+
+The `Watchdog` alert fires constantly as a heartbeat — it proves the pipeline is alive. You don't want that emailed every 4 hours.
+
+---
+
+### AlertManager UI Live
+
+![AlertManager UI live](docs/screenshots/210-alertmanager-ui-live.png)
+*AlertManager UI at http://63.184.235.88:30031 — alerts visible immediately after pod started*
+
+![AlertManager KubeSchedulerDown](docs/screenshots/211-alertmanager-kubeschedulerdown.png)
+*KubeSchedulerDown and other k3s false-positive alerts — k3s uses different component names so Prometheus can't find the standard scheduler endpoint*
+
+![AlertManager crashloop CPU throttling](docs/screenshots/212-alertmanager-crashloop-cpu-throttling.png)
+*CrashLoopBackOff and CPUThrottlingHigh alerts firing simultaneously — the monitoring stack detecting its own instability*
+
+---
+
+### Real Alerts from a Real Incident
+
+The best test of an alerting system is a real incident. During AlertManager setup, Grafana entered CrashLoopBackOff again (the `isDefault:true` ConfigMap conflict recurring after a reboot):
+
+![Grafana CrashLoopBackOff AlertManager](docs/screenshots/213-grafana-crashloopbackoff-alertmanager.png)
+*monitoring-grafana 2/3 CrashLoopBackOff — 12 restarts. AlertManager immediately detected and fired KubeDeploymentReplicasMismatch*
+
+The alert fired because the Grafana deployment had 0 available replicas instead of the expected 1. Once we patched the ConfigMap and deleted the old pod, Grafana recovered — and AlertManager automatically sent the resolved email:
+
+![Email resolved replicasmismatch](docs/screenshots/214-email-resolved-replicasmismatch.png)
+*[RESOLVED] KubeDeploymentReplicasMismatch — AlertManager sent the recovery email automatically because send_resolved: true was configured*
+
+![Email resolved crashlooping](docs/screenshots/217-email-resolved-crashlooping.png)
+*[RESOLVED] KubePodCrashLooping — pod crash loop cleared, resolved email delivered*
+
+The API server also generated an alert from the TLS timeouts during memory pressure:
+
+![Email firing API budget burn](docs/screenshots/218-email-firing-api-budget-burn.png)
+*[FIRING] KubeAPIErrorBudgetBurn — API server burned error budget from kubectl TLS timeouts during node memory exhaustion*
+
+---
+
+### AlertManager Status — Full Config Loaded
+
+![AlertManager status config](docs/screenshots/220-alertmanager-status-config.png)
+*AlertManager Status tab — full config visible: Gmail SMTP with password file path, routing tree (gmail default, null for Watchdog), both receivers confirmed*
+
+![AlertManager UI API budget burn](docs/screenshots/219-alertmanager-ui-api-budget-burn.png)
+*AlertManager Alerts tab — KubeAPIErrorBudgetBurn firing, visible in UI at the same time as email was delivered*
+
+![All pods running AlertManager](docs/screenshots/216-all-pods-running-alertmanager.png)
+*All monitoring pods Running — AlertManager 2/2, Prometheus 2/2, Grafana 3/3, Loki 1/1, Promtail 1/1*
+
+---
+
+### The Full Observability Stack
+
+| Pillar | Tool | Status |
+|--------|------|--------|
+| Metrics | Prometheus + Grafana | ✅ Dashboards, resource tracking |
+| Logs | Loki + Promtail | ✅ Structured logs from all 12 services |
+| Alerting | AlertManager + Gmail | ✅ Firing and resolved emails confirmed |
+
+```
+Prometheus (detects) → AlertManager (routes) → Gmail (notifies)
+```
+
+In production, this pipeline means an engineer gets paged when something breaks and gets a follow-up when it recovers — without anyone having to watch dashboards. The `send_resolved: true` setting is what closes the loop.
 
 ---
 
