@@ -3182,10 +3182,129 @@ In production, this pipeline means an engineer gets paged when something breaks 
 ## Phase 5 — Security + Load Test *(in progress)*
 
 - [x] Integrate Trivy image scanning into Jenkins pipeline — scanning on every build, 5 HIGH found in Go stdlib v1.26.2 (fix: upgrade to 1.26.3)
-- [ ] Deploy HashiCorp Vault for secrets management
+- [x] Upgrade k3s node t3.medium → t3.large via AWS Console (in-place, preserves EBS volume and secrets)
+- [x] AWS Secrets Manager + External Secrets Operator — AlertManager secret survives cluster rebuilds automatically
 - [ ] Write k6 load test scripts
 - [ ] Run load test and observe HPA scaling in real time
 - [ ] Document Trivy scan results and k6 performance metrics
+
+---
+
+### Node Resize — t3.medium to t3.large
+
+Prometheus metrics showed the cluster was at **87.4% actual memory usage at idle** — before any real traffic. With AlertManager added, the node froze twice under normal operation. The data made the decision clear.
+
+**Why via AWS Console and not Terraform:**
+
+![k3s instance stopped for resize](docs/screenshots/221-k3s-instance-stopped-for-resize.png)
+*k3s instance stopped in preparation for instance type change — console resize avoids Terraform's "forces replacement" behaviour*
+
+A previous Terraform apply had forced instance replacement (destroy + create new AMI) when the instance type changed — wiping all configuration. AWS Console resize is an **in-place operation**: the EBS volume is preserved, same instance ID, same Elastic IP.
+
+![Console instance type change](docs/screenshots/222-console-instance-type-change.png)
+*AWS Console — Change Instance Type from t3.medium to t3.large. In-place change, no new AMI, no data loss.*
+
+![t3.large confirmed](docs/screenshots/224-t3large-confirmed.png)
+*t3.large confirmed in AWS Console — 8GB RAM, double the previous capacity*
+
+**Terraform code updated to match reality** — `terraform.tfvars` updated to `t3.large`. Running `terraform plan` after the resize caught a critical issue:
+
+![Terraform plan instance downgrade warning](docs/screenshots/238-terraform-plan-instance-downgrade-warning.png)
+*Terraform plan showing it wanted to DOWNGRADE back to t3.medium — the code hadn't been updated to match the console change. Always keep IaC in sync with manual changes.*
+
+---
+
+### Secrets Management — AWS Secrets Manager + External Secrets Operator
+
+**The problem demonstrated:**
+
+After the resize, we deliberately deleted the AlertManager SMTP secret to demonstrate what happens after a cluster rebuild:
+
+![AlertManager secret deleted](docs/screenshots/228-alertmanager-secret-deleted.png)
+*kubectl delete secret alertmanager-smtp-secret — secret gone*
+
+AlertManager pod was still Running because the secret file was already mounted in memory. Deleting the pod forced it to try remounting:
+
+![AlertManager pod deleted](docs/screenshots/230-alertmanager-pod-deleted.png)
+*Pod deleted to force a fresh start — now it must remount the secret volume*
+
+![AlertManager UI unreachable](docs/screenshots/231-alertmanager-ui-unreachable.png)
+*ERR_CONNECTION_TIMED_OUT — AlertManager unreachable. The pod can't start without the secret.*
+
+![AlertManager FailedMount secret not found](docs/screenshots/233-alertmanager-failedmount-secret-not-found.png)
+*kubectl describe pod Events — MountVolume.SetUp failed: secret "alertmanager-smtp-secret" not found. Failed 22 times over 30 minutes.*
+
+This is exactly what happens after a Terraform destroy+create or cluster reinstall. The secret is not in Git. Nothing recreates it automatically.
+
+---
+
+**The fix — AWS Secrets Manager + External Secrets Operator:**
+
+**Architecture:**
+```
+AWS Secrets Manager          External Secrets Operator          Kubernetes
+cloudcommerce/             →  ClusterSecretStore             →  Secret
+alertmanager-smtp             ExternalSecret (sync 1h)           alertmanager-smtp-secret
+(permanent, audited)          (watches & reconciles)             (auto-created on any cluster)
+```
+
+**Step 1 — IAM policy giving k3s permission to read from Secrets Manager:**
+
+![IAM policy Secrets Manager](docs/screenshots/234-iam-policy-secrets-manager.png)
+*Terraform adding secretsmanager:GetSecretValue permission to the k3s IAM role — least privilege, scoped to cloudcommerce/* secrets only*
+
+![Terraform plan IAM policy](docs/screenshots/239-terraform-plan-iam-policy.png)
+*Terraform plan — 2 to add (IAM policy + attachment), 1 to change (security group descriptions), 0 to destroy*
+
+![Terraform apply complete](docs/screenshots/240-terraform-apply-complete.png)
+*Apply complete — IAM policy created and attached to k3s role. Security group updated in-place.*
+
+**Step 2 — Secret stored in AWS Secrets Manager:**
+
+The AWS CLI user (`github-actions-deploy`) only has ECR permissions — correctly blocked from creating secrets:
+
+![AWS CLI access denied](docs/screenshots/241-aws-cli-access-denied-secrets-manager.png)
+*AccessDeniedException — the CI/CD user cannot create secrets. Correct. Secret created via AWS Console instead.*
+
+![AWS Secrets Manager secret created](docs/screenshots/242-aws-secrets-manager-secret-created.png)
+*cloudcommerce/alertmanager-smtp created in AWS Secrets Manager — permanent storage, audited, versioned*
+
+**Step 3 — External Secrets Operator deployed via ArgoCD:**
+
+![ClusterSecretStore yaml](docs/screenshots/235-cluster-secret-store-yaml.png)
+*ClusterSecretStore manifest — connects ESO to AWS Secrets Manager using the EC2 instance profile (no credentials in code)*
+
+![External Secrets ArgoCD app](docs/screenshots/236-external-secrets-argocd-app.png)
+*ArgoCD Application for External Secrets Operator — deployed via Helm chart, GitOps-managed*
+
+![ArgoCD monitoring extras created](docs/screenshots/243-argocd-monitoring-extras-created.png)
+*monitoring-extras ArgoCD Application applied — deploys ClusterSecretStore and ExternalSecret manifests*
+
+**Step 4 — ESO syncs secret from AWS into Kubernetes automatically:**
+
+![ESO pods running](docs/screenshots/245-eso-pods-all-running.png)
+*External Secrets Operator pods Running in external-secrets namespace*
+
+![Kubernetes secret restored by ESO](docs/screenshots/246-kubernetes-secret-restored-by-eso.png)
+*kubectl get secret — alertmanager-smtp-secret exists again. Created by ESO, not manually.*
+
+![ExternalSecret synced](docs/screenshots/247-eso-externalsecret-synced.png)
+*ExternalSecret STATUS: SecretSynced, READY: True — ESO successfully fetched from AWS and created the Kubernetes secret*
+
+**The result:** AlertManager recovered automatically. No manual `kubectl create secret`. No password typed anywhere. The secret will now survive any cluster rebuild — ArgoCD deploys the ExternalSecret manifest, ESO fetches from AWS, Kubernetes secret appears.
+
+---
+
+### Why This Matters
+
+| Scenario | Before (manual secret) | After (ESO + Secrets Manager) |
+|----------|----------------------|-------------------------------|
+| In-place resize | ✅ Survived (same EBS) | ✅ Survived |
+| Terraform replacement | ❌ Secret gone | ✅ Auto-recreated |
+| Cluster reinstall | ❌ Secret gone | ✅ Auto-recreated |
+| New engineer rebuilds cluster | ❌ Needs password from someone | ✅ Auto-recreated |
+| Secret rotation | ❌ Manual kubectl update | ✅ Update in AWS, ESO syncs within 1h |
+| Audit trail | ❌ None | ✅ AWS CloudTrail logs every access |
 
 ---
 
