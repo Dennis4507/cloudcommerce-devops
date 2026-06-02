@@ -72,7 +72,7 @@ adService:
   name: adservice
   resources:
     requests:
-      cpu: 200m
+      cpu: 50m
       memory: 180Mi
     limits:
       cpu: 300m
@@ -83,7 +83,7 @@ cartService:
   name: cartservice
   resources:
     requests:
-      cpu: 200m
+      cpu: 50m
       memory: 128Mi
     limits:
       cpu: 300m
@@ -94,7 +94,7 @@ checkoutService:
   name: checkoutservice
   resources:
     requests:
-      cpu: 100m
+      cpu: 50m
       memory: 64Mi
     limits:
       cpu: 200m
@@ -105,7 +105,7 @@ currencyService:
   name: currencyservice
   resources:
     requests:
-      cpu: 100m
+      cpu: 50m
       memory: 128Mi
     limits:
       cpu: 200m
@@ -116,7 +116,7 @@ emailService:
   name: emailservice
   resources:
     requests:
-      cpu: 100m
+      cpu: 50m
       memory: 64Mi
     limits:
       cpu: 200m
@@ -141,7 +141,7 @@ frontend:
       labelValue: ingressgateway
   resources:
     requests:
-      cpu: 100m
+      cpu: 50m
       memory: 64Mi
     limits:
       cpu: 200m
@@ -153,7 +153,7 @@ loadGenerator:
   checkFrontendInitContainer: true
   resources:
     requests:
-      cpu: 300m
+      cpu: 100m
       memory: 256Mi
     limits:
       cpu: 500m
@@ -164,7 +164,7 @@ paymentService:
   name: paymentservice
   resources:
     requests:
-      cpu: 100m
+      cpu: 50m
       memory: 128Mi
     limits:
       cpu: 200m
@@ -177,7 +177,7 @@ productCatalogService:
   extraLatency: ""
   resources:
     requests:
-      cpu: 100m
+      cpu: 50m
       memory: 64Mi
     limits:
       cpu: 200m
@@ -188,7 +188,7 @@ recommendationService:
   name: recommendationservice
   resources:
     requests:
-      cpu: 100m
+      cpu: 50m
       memory: 220Mi
     limits:
       cpu: 200m
@@ -199,7 +199,7 @@ shippingService:
   name: shippingservice
   resources:
     requests:
-      cpu: 100m
+      cpu: 50m
       memory: 64Mi
     limits:
       cpu: 200m

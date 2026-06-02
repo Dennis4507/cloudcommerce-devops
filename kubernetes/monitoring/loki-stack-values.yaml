@@ -43,6 +43,14 @@ promtail:
 # Grafana already installed via kube-prometheus-stack — disable here
 grafana:
   enabled: false
+  # Disable the sidecar datasource ConfigMap that loki-stack creates automatically.
+  # Even with grafana.enabled: false, the chart creates a ConfigMap called
+  # loki-loki-stack with isDefault: true. This conflicts with Prometheus which is
+  # also isDefault: true, causing Grafana to CrashLoopBackOff on every restart.
+  # Loki is already added as a datasource via kube-prometheus-stack additionalDataSources.
+  sidecar:
+    datasources:
+      enabled: false
 
 # Prometheus already installed — disable here
 prometheus:
