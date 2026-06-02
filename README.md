@@ -3181,12 +3181,213 @@ In production, this pipeline means an engineer gets paged when something breaks 
 
 ## Phase 5 — Security + Load Test *(in progress)*
 
-- [x] Integrate Trivy image scanning into Jenkins pipeline — scanning on every build, 5 HIGH found in Go stdlib v1.26.2 (fix: upgrade to 1.26.3)
+- [x] Integrate Trivy image scanning into Jenkins pipeline — scanning on every build
 - [x] Upgrade k3s node t3.medium → t3.large via AWS Console (in-place, preserves EBS volume and secrets)
 - [x] AWS Secrets Manager + External Secrets Operator — AlertManager secret survives cluster rebuilds automatically
-- [ ] Write k6 load test scripts
-- [ ] Run load test and observe HPA scaling in real time
-- [ ] Document Trivy scan results and k6 performance metrics
+- [x] Fix Go stdlib CVEs across all 4 Go services — upgrade base image golang:1.26.2 → golang:1.26.3
+- [x] Fix CRITICAL gRPC CVE in shippingservice — upgrade grpc v1.79.2 → v1.79.3 via go.mod
+- [x] Fix HIGH opentelemetry CVE in shippingservice — upgrade otel v1.39.0 → v1.43.0 via go.mod
+- [ ] Fix remaining Node.js and Python CVEs
+- [ ] Configure HPA — Horizontal Pod Autoscaler
+- [ ] Write k6 load test scripts and run under live traffic
+- [ ] Observe HPA scaling in real time in Grafana
+
+---
+
+### Trivy Image Scanning — CVE Discovery and Remediation
+
+Trivy is a container image vulnerability scanner. Every Jenkins pipeline build runs Trivy against each Docker image before pushing to ECR. If vulnerabilities are found, the pipeline reports them — with `--exit-code 0` during development so builds are not blocked, but findings are visible in every build log.
+
+```
+Jenkins pipeline:
+  Build Image → Trivy Scan → Push to ECR → Update values.yaml
+                   ↑
+                   scans here — before the image ever reaches the cluster
+```
+
+The scan checks three things inside each image:
+- The **OS packages** (Alpine, Debian packages)
+- The **language runtime** (Go stdlib, Python packages, Node.js packages)
+- The **compiled binary** (checks which library versions were linked in at build time)
+
+---
+
+### CVE Discovery — What Trivy Found
+
+Running Trivy across all 12 services on the first full scan produced findings across three categories:
+
+#### Category 1 — Go Standard Library (4 services affected)
+
+All four Go services (`frontend`, `checkoutservice`, `productcatalogservice`, `shippingservice`) were built with `golang:1.26.2-alpine`. The Go 1.26.2 standard library contained 5 HIGH severity vulnerabilities:
+
+| CVE | Component | Impact | Fixed In |
+|-----|-----------|--------|----------|
+| CVE-2026-33811 | net package | DoS via long CNAME DNS response | Go 1.26.3 |
+| CVE-2026-33814 | HTTP/2 transport | Infinite loop via crafted SETTINGS frame | Go 1.26.3 |
+| CVE-2026-39820 | net/mail | Crash via malformed email address | Go 1.26.3 |
+| CVE-2026-39836 | net | Panic via NUL byte in port lookup | Go 1.26.3 |
+| CVE-2026-42499 | net/mail | DoS via pathological phrase parser input | Go 1.26.3 |
+
+All five are **Denial of Service** bugs — a crafted network request crashes the service. No data exfiltration, but availability is at risk.
+
+**Root cause:** The base image `golang:1.26.2-alpine` bakes the vulnerable Go standard library into the compiled binary. Even though the final runtime image (`gcr.io/distroless/static`) contains no Go installation, the binary itself carries the vulnerable code.
+
+#### Category 2 — Go Module Dependencies (shippingservice only)
+
+After fixing the stdlib CVEs, two further vulnerabilities remained in `shippingservice` — in third-party packages declared in `go.mod`:
+
+| CVE | Library | Severity | Impact | Fixed In |
+|-----|---------|----------|--------|----------|
+| CVE-2026-33186 | `google.golang.org/grpc v1.79.2` | **CRITICAL** | Authorization bypass via improper HTTP/2 path validation | v1.79.3 |
+| CVE-2026-29181 | `go.opentelemetry.io/otel v1.39.0` | HIGH | DoS via crafted multi-value baggage headers | v1.41.0 |
+
+The CRITICAL grpc CVE is significant: an attacker could craft an HTTP/2 request that bypasses authorization checks in the gRPC server entirely — skipping authentication without valid credentials.
+
+The other three Go services (`frontend`, `checkoutservice`, `productcatalogservice`) already had `grpc v1.79.3` and `otel v1.43.0` in their `go.mod` files. Only `shippingservice` was behind — it had simply not been updated when the rest of the project was upgraded.
+
+#### Category 3 — Node.js and Python Dependencies (remaining)
+
+Several non-Go services have vulnerabilities in their own dependency ecosystems:
+
+| Service | Language | Notable Findings |
+|---------|----------|-----------------|
+| `paymentservice` | Node.js | CRITICAL: `protobufjs v6.11.4` (arbitrary code execution), HIGH: `lodash`, `tar`, `minimatch` |
+| `recommendationservice` | Python | HIGH: `pyasn1 v0.5.0`, `urllib3 v2.6.3` |
+| `shoppingassistantservice` | Python | Multiple findings in debian base and Python packages |
+
+These follow the same remediation pattern — `npm update` for Node.js, `pip install --upgrade` for Python — and are documented in `docs/learnings/trivy-and-container-security.md`.
+
+---
+
+### Fix 1 — Go Standard Library: Base Image Upgrade
+
+The fix is a single line change per Dockerfile. All four Go services had identical build stages:
+
+```dockerfile
+# Before — vulnerable Go stdlib
+FROM --platform=$BUILDPLATFORM golang:1.26.2-alpine@sha256:f858... AS builder
+
+# After — patched Go stdlib, SHA pin removed (can't verify new hash without Docker locally)
+FROM --platform=$BUILDPLATFORM golang:1.26.3-alpine AS builder
+```
+
+The SHA digest (`@sha256:f858...`) was also removed. The digest locks the image to a specific bit-for-bit version — a good production practice — but requires running Docker locally to calculate the correct hash for the new version. Removing it allows Docker to pull the tag directly. In production, the correct approach is to re-pin after verifying the new image digest.
+
+Four commits across two pushes updated all affected Dockerfiles:
+- `b177e9ea` — fixed `frontend/Dockerfile`
+- `ffafa610` — fixed `productcatalogservice`, `shippingservice`, `checkoutservice` Dockerfiles
+
+**The Dockerfile change — one line per service:**
+
+![Dockerfile golang 1263 fix](docs/screenshots/253-dockerfile-golang-1263-fix.png)
+*frontend/Dockerfile — `golang:1.26.2-alpine` changed to `golang:1.26.3-alpine`. The SHA digest pin was removed because the correct hash for the new version requires Docker locally to verify. Same one-line change applied to productcatalogservice, shippingservice, and checkoutservice Dockerfiles.*
+
+**Before (Go 1.26.2) — shippingservice Trivy scan showing 7 findings:**
+
+![Trivy shippingservice before fix](docs/screenshots/249-trivy-shipping-before-7high-1critical.png)
+*Trivy scan on shippingservice built with golang:1.26.2 — Total: 7 (HIGH: 6, CRITICAL: 1). The stdlib CVEs are all present alongside the grpc and otel module CVEs.*
+
+**After upgrading to Go 1.26.3 — stdlib CVEs gone, 2 module CVEs remain:**
+
+![Trivy shippingservice go1263 still 2 cves](docs/screenshots/254-trivy-shipping-go1263-still-2-cves.png)
+*After base image upgrade to golang:1.26.3 — stdlib CVEs eliminated. 2 remaining: grpc (CRITICAL) and otel (HIGH). These are Go module dependencies, not stdlib — a different fix is required.*
+
+---
+
+### The Missed Webhook — Why the Build Didn't Trigger
+
+Before the Trivy fix could be verified, the EC2 instances had been stopped (end-of-session cost management). When the fix was pushed to GitHub, the webhook fired but Jenkins was offline:
+
+![Nodes stopped webhook missed](docs/screenshots/250-nodes-stopped-webhook-missed.png)
+*Instances stopped before push — Jenkins was unreachable when GitHub sent the webhook. The event was lost.*
+
+![Webhook redeliver success](docs/screenshots/251-webhook-redeliver-success.png)
+*GitHub → microservices-demo → Settings → Webhooks → Recent Deliveries → Redeliver. The webhook was redelivered after starting the instances, triggering the build correctly.*
+
+![Jenkins b177e9ea build triggered](docs/screenshots/252-jenkins-b177e9ea-build-triggered.png)
+*Jenkins received the redelivered webhook — build for commit b177e9ea started. This is the build that confirmed the Dockerfile fix.*
+
+---
+
+### Fix 2 — Go Module Dependencies: go.mod Update
+
+The gRPC and opentelemetry CVEs could not be fixed by changing the base image. These are third-party packages declared in `shippingservice/go.mod` — the dependency manifest that tells Go which external packages to include at build time.
+
+**Why go.mod alone is not enough:**
+
+`go.mod` has a companion file `go.sum` — a file containing cryptographic checksums (SHA-256 hashes) of every dependency. Go verifies these checksums at build time. If a package version is updated in `go.mod` but `go.sum` still contains the old checksum, Go refuses to build:
+
+```
+verifying google.golang.org/grpc@v1.79.3: checksum mismatch
+```
+
+This is a deliberate security feature — it prevents supply chain attacks where a package is silently replaced with a malicious version.
+
+**The CRITICAL gRPC CVE in Jenkins build output:**
+
+![Trivy shipping critical grpc](docs/screenshots/255-trivy-shipping-critical-grpc.png)
+*Jenkins console — Trivy scan showing `google.golang.org/grpc CVE-2026-33186 CRITICAL` in shippingservice. Authorization bypass via improper HTTP/2 path validation. Fixed version: v1.79.3.*
+
+**AlertManager fired immediately — real CVE findings generating real alerts:**
+
+![AlertManager CVE alert emails](docs/screenshots/256-alertmanager-emails-cve-alerts.png)
+*AlertManager emails triggered by the build activity and node instability during CVE investigation — the observability stack detecting real events in real time.*
+
+![AlertManager email inbox](docs/screenshots/257-alertmanager-email-inbox.png)
+*Email inbox showing the volume of alerts received — firing and resolved notifications from AlertManager during the CVE remediation session.*
+
+**The fix requires Go installed locally** to download the new packages and generate the correct checksums:
+
+**Installing Go in WSL:**
+
+![WSL Go install](docs/screenshots/258-wsl-go-install.png)
+*`sudo snap install go --classic` — Go 1.26.3 installed in WSL. The `--classic` flag is required because Go needs unrestricted filesystem access to download packages and write to the module cache.*
+
+**Understanding go.mod and go.sum before making changes:**
+
+![gomod gosum files](docs/screenshots/262-gomod-gosum-files.png)
+*`go.mod` and `go.sum` files in shippingservice — go.mod is the dependency manifest (which packages and versions), go.sum is the cryptographic receipt (SHA-256 fingerprints of every downloaded package). Both must be updated together.*
+
+```bash
+# Install Go in WSL
+sudo snap install go --classic
+
+# Navigate to the service
+cd /mnt/c/Users/OnlyM/Devops\ Project/microservices-demo/src/shippingservice
+
+# Download patched versions — Go fetches them and writes real checksums to go.sum
+go get google.golang.org/grpc@v1.79.3
+go get go.opentelemetry.io/otel@v1.43.0
+
+# Clean up unused dependencies and finalise go.sum
+go mod tidy
+```
+
+**Running the upgrade commands:**
+
+![go get grpc otel upgrade](docs/screenshots/259-go-get-grpc-otel-upgrade.png)
+*`go get google.golang.org/grpc@v1.79.3` and `go get go.opentelemetry.io/otel@v1.43.0` — Go downloads the patched packages, calculates their checksums, and updates both go.mod and go.sum. Output confirms: `upgraded google.golang.org/grpc v1.79.2 => v1.79.3` and `upgraded go.opentelemetry.io/otel v1.39.0 => v1.43.0`.*
+
+![go mod tidy](docs/screenshots/260-go-mod-tidy.png)
+*`go mod tidy` — downloads all transitive dependencies (packages that the packages depend on), removes anything no longer needed, and finalises go.sum. go.sum changed from 89 lines to match all new dependency fingerprints.*
+
+Both `go.mod` and `go.sum` were then committed and pushed. Jenkins picked up the new dependency files on the next build.
+
+**Shippingservice Trivy scan — 0 vulnerabilities after go.mod fix:**
+
+![Trivy shippingservice clean 0 cves](docs/screenshots/261-trivy-shipping-clean-0-cves.png)
+*Trivy scan on shippingservice:6e0476ed — `gobinary: 0 vulnerabilities`. The CRITICAL grpc CVE and HIGH otel CVE are gone. Before: Total 10 (HIGH: 9, CRITICAL: 1). After: Total 0.*
+
+**What this teaches:**
+
+There are two distinct layers of Go vulnerabilities — the language runtime (fixed by Dockerfile) and the module dependencies (fixed by go.mod + go.sum). Trivy surfaces both. The fix mechanism is completely different for each:
+
+| Layer | Where the bug lives | How to fix |
+|-------|-------------------|------------|
+| Go stdlib | The Go compiler/runtime itself | Upgrade base image version |
+| Go modules | Third-party packages in go.mod | Run `go get <pkg>@<version>` + `go mod tidy` |
+
+In a production environment with many Go services, **Dependabot** or **Renovate** automates this entirely — opening a pull request each week with updated `go.mod` and `go.sum` files for every outdated or vulnerable dependency. Engineers review and merge; no manual `go get` commands required.
 
 ---
 
