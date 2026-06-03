@@ -29,6 +29,7 @@ Every real issue encountered during this project, documented with the exact CLI 
 19. [ECR Token Expiry — ImagePullBackOff After 12 Hours](#19-ecr-token-expiry--imagepullbackoff-after-12-hours)
 20. [CPU Requests at 100% — Rolling Update Deadlock on Single Node](#20-cpu-requests-at-100--rolling-update-deadlock-on-single-node)
 21. [Grafana CrashLoopBackOff — Two isDefault Datasources (Permanent Fix)](#21-grafana-crashloopbackoff--two-isdefault-datasources-permanent-fix)
+22. [k3s False Positive Alerts + svclb HostPort Conflict](#22-k3s-false-positive-alerts--svclb-hostport-conflict)
 
 ---
 
@@ -1238,6 +1239,156 @@ monitoring-grafana-5479bc5f75-4zvm4   3/3   Running   0   74m
 | Disable sidecar.datasources ← this fix | ConfigMap never created — nothing to conflict |
 
 The root fix disables the source of the conflict rather than patching its output.
+
+---
+
+## 22. k3s False Positive Alerts + svclb HostPort Conflict
+
+### Symptom
+
+AlertManager firing five simultaneous alerts:
+
+```
+[FIRING:1] KubeSchedulerDown        (critical)
+[FIRING:1] KubeControllerManagerDown (critical)
+[FIRING:1] KubeProxyDown            (critical)
+[FIRING:1] KubeDaemonSetRolloutStuck kube-system svclb-frontend-external-9549aa03 (warning)
+[FIRING:1] KubePodNotReady kube-system svclb-frontend-external-9549aa03-8r6nd (warning)
+```
+
+```bash
+$ kubectl get pods -n kube-system | grep svclb-frontend
+svclb-frontend-external-9549aa03-8r6nd   0/1   Pending   0   11d
+```
+
+The website is fully accessible at http://63.184.235.88 the entire time — these are not application failures.
+
+![AlertManager firing five alerts simultaneously](../screenshots/291-alertmanager-emails-firing.png)
+*AlertManager inbox — five alerts firing. Three are permanent k3s architectural false positives. Two are caused by a Pending pod that can never start due to a port conflict.*
+
+### Root Cause — Two Separate Problems
+
+**Problem 1 — k3s false positives (KubeSchedulerDown, KubeControllerManagerDown, KubeProxyDown):**
+
+`kube-prometheus-stack` ships with alert rules written for standard upstream Kubernetes, which runs scheduler, controller-manager, and kube-proxy as **separate processes** with individual metrics endpoints:
+
+```
+Standard Kubernetes:
+  kube-scheduler     → :10259/metrics  ← Prometheus scrapes here
+  kube-controller    → :10257/metrics  ← Prometheus scrapes here
+  kube-proxy         → :10249/metrics  ← Prometheus scrapes here
+
+k3s:
+  k3s server binary  → all of the above combined, no separate endpoints
+  Prometheus checks standard ports → finds nothing → fires "Down" alerts
+```
+
+These fire **permanently** on k3s. The components are running — Prometheus just doesn't know where to find them.
+
+**Problem 2 — HostPort 80 conflict (KubeDaemonSetRolloutStuck, KubePodNotReady):**
+
+`externalService: true` in the Helm values created a `frontend-external` Service of type `LoadBalancer`. k3s's ServiceLB (Klipper) controller creates a DaemonSet pod (`svclb-frontend-external`) for every LoadBalancer service — this pod binds directly to the node's HostPort 80 to proxy traffic.
+
+But Traefik's own ServiceLB pod (`svclb-traefik`) already owns HostPort 80. A HostPort can only be bound by one process:
+
+```
+Node HostPort 80:
+  svclb-traefik-xxx          → RUNNING ← owns port 80
+  svclb-frontend-external-xxx → PENDING ← can't start, port taken
+```
+
+The website was served by the Traefik Ingress the entire time. The LoadBalancer service was never load-bearing — it was redundant from the start.
+
+### Troubleshooting Methodology
+
+```bash
+# Step 1 — Check the stuck pod
+kubectl get pods -n kube-system | grep svclb-frontend
+# Pending for days = scheduling failure, not a transient issue
+
+# Step 2 — Describe it to see why
+kubectl describe pod svclb-frontend-external-9549aa03-8r6nd -n kube-system
+# Look for: "hostPort" in the spec, and any FailedScheduling events
+# If no scheduling events, the pod is pending because the port is already bound
+
+# Step 3 — Confirm Traefik already owns port 80
+kubectl get pods -n kube-system | grep svclb-traefik
+# If svclb-traefik is Running and svclb-frontend is Pending → HostPort conflict
+
+# Step 4 — Confirm the website works via Traefik Ingress (not the LoadBalancer)
+kubectl get ingress -n online-boutique
+# If an Ingress exists pointing at the frontend service, traffic is via Traefik
+# The LoadBalancer service is redundant
+
+# Step 5 — Confirm the three k3s "Down" alerts are false positives
+kubectl get pods -n kube-system | grep k3s
+# The k3s-server binary runs everything — no separate scheduler/controller/proxy pods exist
+# This confirms the Prometheus scrape targets simply don't exist on k3s
+```
+
+![svclb-frontend-external pod Pending in kube-system for 11 days](../screenshots/288-svclb-pending-kube-system.png)
+*`kubectl get pods -n kube-system` — `svclb-frontend-external-9549aa03-8r6nd` Pending for 11 days. The website was live the entire time via Traefik — this pod was never needed.*
+
+### Fix — Two Changes
+
+**Fix 1 — Silence k3s false positive alerts** (`kubernetes/monitoring/kube-prometheus-stack-values.yaml`):
+
+```yaml
+route:
+  routes:
+    - receiver: 'null'
+      matchers:
+        # Watchdog/InfoInhibitor: standard always-firing non-issues
+        # KubeSchedulerDown / KubeControllerManagerDown / KubeProxyDown:
+        #   k3s runs these as one binary — standard endpoints don't exist
+        # etcdInsufficientMembers: k3s embeds etcd differently
+        - alertname =~ "Watchdog|InfoInhibitor|KubeSchedulerDown|KubeControllerManagerDown|KubeProxyDown|etcdInsufficientMembers"
+```
+
+**Fix 2 — Remove the redundant LoadBalancer service** (`kubernetes/apps/online-boutique/values.yaml`):
+
+```yaml
+frontend:
+  externalService: false   # Traefik Ingress handles port 80 — LoadBalancer causes HostPort conflict
+```
+
+Commit both, push to `cloudcommerce-devops`. ArgoCD syncs in ~3 minutes:
+- AlertManager reloads config → k3s false positive alerts routed to null receiver
+- `frontend-external` Service deleted → ServiceLB controller removes the Pending pod
+
+```bash
+# Verify after ArgoCD syncs
+kubectl get pods -n kube-system | grep svclb-frontend
+# (no output — pod is gone)
+
+kubectl get svc -n online-boutique | grep frontend
+# frontend   ClusterIP   ← no more LoadBalancer type
+
+curl -I http://63.184.235.88
+# HTTP/1.1 200 OK ← Traefik Ingress still serving traffic normally
+```
+
+### Result
+
+![All alerts RESOLVED after the fix](../screenshots/292-all-issues-resolved.png)
+*`[RESOLVED]` emails from AlertManager — all 5 alerts cleared automatically. No manual pod deletion or cluster restart needed.*
+
+![kubectl get pods -A clean after fix](../screenshots/294-kubectl-pods-success.png)
+*`kubectl get pods -A` — all namespaces, all pods Running. The `svclb-frontend-external` pod is gone. kube-system is clean.*
+
+```
+[RESOLVED] KubeSchedulerDown        ← null route active
+[RESOLVED] KubeControllerManagerDown ← null route active
+[RESOLVED] KubeProxyDown            ← null route active
+[RESOLVED] KubeDaemonSetRolloutStuck ← frontend-external Service deleted
+[RESOLVED] KubePodNotReady          ← svclb pod removed
+```
+
+### Why This Matters
+
+**k3s false positives are predictable.** Any k3s cluster running `kube-prometheus-stack` will fire these three alerts. They should be silenced on day one. Not knowing this would lead to alert fatigue — engineers start ignoring alerts because too many of them are noise. That is how real outages get missed.
+
+**HostPort conflicts are silent.** The LoadBalancer service created the stuck pod but the website still worked — because the Ingress was doing the job. Without AlertManager surfacing the stuck DaemonSet, this could have gone undetected indefinitely. The monitoring stack caught a configuration problem the application layer hid.
 
 ---
 

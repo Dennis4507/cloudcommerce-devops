@@ -3190,7 +3190,8 @@ In production, this pipeline means an engineer gets paged when something breaks 
 - [x] Fix Grafana CrashLoopBackOff (124 restarts) — disabled loki-stack sidecar datasource ConfigMap permanently
 - [x] Fix rolling update deadlock — right-sized CPU requests from 1500m → 550m based on Prometheus metrics
 - [x] Fix ECR token expiry — added auto-refresh cron job to k3s Ansible playbook, token refreshes every 6 hours
-- [ ] Fix remaining Node.js and Python CVEs
+- [x] Fix k3s false positive alerts — KubeSchedulerDown, KubeControllerManagerDown, KubeProxyDown silenced via AlertManager null route
+- [x] Fix redundant frontend-external LoadBalancer — svclb HostPort 80 conflict with Traefik resolved, stuck Pending pod removed
 - [ ] Configure HPA — Horizontal Pod Autoscaler
 - [ ] Write k6 load test scripts and run under live traffic
 - [ ] Observe HPA scaling in real time in Grafana
@@ -3719,6 +3720,149 @@ ECR tokens are deliberately temporary (12 hours) for security — a stolen token
 - **Cron-based refresh** — what we implemented here (appropriate for k3s without IRSA support)
 
 The EC2 IAM instance profile is the key — it lets the k3s server authenticate with AWS without any stored credentials. The script runs `aws ecr get-login-password` which hits the instance metadata service at `169.254.169.254` to get temporary credentials from the IAM role. No access keys. No secrets in files.
+
+---
+
+### Incident 7 — k3s False Positive Alerts + Redundant LoadBalancer Causing Pending Pod
+
+**What happened — in simple terms:**
+
+AlertManager was sending emails about five "critical" and "warning" alerts. Three of them were saying that core parts of Kubernetes were completely down — the scheduler, the controller manager, and the proxy. The other two were complaining about a pod that had been stuck and never started for 11 days.
+
+None of them were real problems.
+
+**The two separate root causes:**
+
+#### Root Cause 1 — k3s Looks Different to Prometheus
+
+Standard Kubernetes runs its internal components (scheduler, controller manager, network proxy) as separate, dedicated processes — each with its own metrics endpoint that Prometheus knows how to scrape. The `kube-prometheus-stack` Helm chart ships with alert rules written for this standard setup.
+
+k3s is different. It combines all those components into a single binary called `k3s server`. There are no separate processes, and the standard metrics endpoints don't exist. Prometheus checks for them, finds nothing, and concludes the components are down. They were never down — they just live somewhere Prometheus doesn't know to look.
+
+```
+Standard Kubernetes (what Prometheus expects):
+  kube-scheduler process   → :10259/metrics  ← Prometheus scrapes this
+  kube-controller process  → :10257/metrics  ← Prometheus scrapes this
+  kube-proxy process       → :10249/metrics  ← Prometheus scrapes this
+
+k3s:
+  k3s server binary (all of the above combined) → no separate endpoints
+  Prometheus finds nothing → fires KubeSchedulerDown, KubeControllerManagerDown, KubeProxyDown
+```
+
+These alerts will fire **permanently** on any k3s cluster running `kube-prometheus-stack`. The fix is to route them to AlertManager's `null` receiver — the same pattern used for `Watchdog`.
+
+![AlertManager emails firing — k3s false positives plus svclb alert](docs/screenshots/291-alertmanager-emails-firing.png)
+*AlertManager inbox — five alerts firing simultaneously. Three are k3s structural false positives that will never resolve without silencing. Two are caused by the stuck svclb pod.*
+
+#### Root Cause 2 — Two Things Competing for Port 80
+
+Port 80 is the standard HTTP port. On this k3s cluster, **Traefik** is already listening on port 80. It was set up in Phase 3 as the Ingress controller — it receives all HTTP traffic and routes it to the right service based on Ingress rules.
+
+Later, `externalService: true` was set in `values.yaml`. This created a `frontend-external` Service of type `LoadBalancer`. On k3s, a `LoadBalancer` service triggers ServiceLB (Klipper) to create a DaemonSet pod that tries to bind directly to port 80 on the node — the same port Traefik already owns.
+
+Only one process can own a port at a time. The ServiceLB pod couldn't start. It sat in `Pending` for 11 days:
+
+```bash
+$ kubectl get pods -n kube-system | grep svclb-frontend
+svclb-frontend-external-9549aa03-8r6nd   0/1   Pending   0   11d
+```
+
+Meanwhile, the website was live and working the entire time — served by Traefik's Ingress rule, not by the LoadBalancer. The `frontend-external` service was completely redundant. Prometheus noticed the Pending pod and fired two more alerts.
+
+![svclb-frontend-external pod stuck Pending in kube-system for 11 days](docs/screenshots/288-svclb-pending-kube-system.png)
+*`kubectl get pods -n kube-system` — `svclb-frontend-external-9549aa03-8r6nd` in Pending state for 11 days. k3s's ServiceLB cannot bind HostPort 80 because Traefik already owns it.*
+
+![ArgoCD application health degraded due to Pending svclb pod](docs/screenshots/290-argocd-app-health-degraded.png)
+*ArgoCD showing app health as Degraded — it detected the DaemonSet pod was not Running and flagged the application. The application itself was serving traffic normally.*
+
+![Online Boutique live and working while alerts were firing](docs/screenshots/289-boutique-live-during-fix.png)
+*Online Boutique fully functional at http://63.184.235.88 during the entire incident — the Traefik Ingress was never affected. The stuck ServiceLB pod was redundant, not load-bearing.*
+
+---
+
+#### Diagnosis — Reading the Alert Details
+
+The alert names told the whole story once decoded:
+
+| Alert | Namespace | Severity | Meaning |
+|-------|-----------|----------|---------|
+| `KubeSchedulerDown` | monitoring | critical | Prometheus can't find kube-scheduler endpoint — k3s false positive |
+| `KubeControllerManagerDown` | monitoring | critical | Same — controller-manager not a separate process on k3s |
+| `KubeProxyDown` | monitoring | critical | Same — k3s doesn't run kube-proxy |
+| `KubeDaemonSetRolloutStuck` | kube-system | warning | DaemonSet `svclb-frontend-external` has a pod that never reached Running |
+| `KubePodNotReady` | kube-system | warning | Pod `svclb-frontend-external-9549aa03-8r6nd` stuck Pending |
+
+```bash
+# Check AlertManager UI for all firing alerts
+# http://63.184.235.88:30031
+
+# Confirm the stuck pod
+kubectl get pods -n kube-system | grep svclb-frontend
+# svclb-frontend-external-9549aa03-8r6nd   0/1   Pending   0   11d
+
+# Describe it to see why it's Pending
+kubectl describe pod svclb-frontend-external-9549aa03-8r6nd -n kube-system
+# Events will show HostPort 80 conflict or resource pressure
+
+# Confirm port 80 is already owned by Traefik
+kubectl get pods -n kube-system | grep svclb-traefik
+# svclb-traefik-xxx   1/1   Running   ← this owns HostPort 80
+
+# Confirm the website works via Traefik Ingress (not via the LoadBalancer)
+kubectl get ingress -n online-boutique
+# NAME             CLASS    HOSTS   ADDRESS          PORTS   AGE
+# online-boutique  traefik  *       63.184.235.88    80      ...
+```
+
+---
+
+#### Fix — Two Changes in One Commit
+
+**Fix 1 — Silence k3s false positives in AlertManager** (`kubernetes/monitoring/kube-prometheus-stack-values.yaml`):
+
+```yaml
+routes:
+  - receiver: 'null'
+    matchers:
+      # These are permanent false positives on k3s — the components exist but
+      # don't expose the standard endpoints kube-prometheus-stack expects
+      - alertname =~ "Watchdog|InfoInhibitor|KubeSchedulerDown|KubeControllerManagerDown|KubeProxyDown|etcdInsufficientMembers"
+```
+
+**Fix 2 — Remove the redundant LoadBalancer service** (`kubernetes/apps/online-boutique/values.yaml`):
+
+```yaml
+frontend:
+  externalService: false   # Traefik Ingress handles port 80 — LoadBalancer causes HostPort conflict
+```
+
+Both changes committed and pushed to `cloudcommerce-devops`. ArgoCD synced within 3 minutes:
+- AlertManager reloaded its config — k3s false positive alerts now routed to null receiver
+- `frontend-external` Service deleted — ServiceLB controller removed the Pending pod automatically
+
+---
+
+#### After the Fix
+
+![All alerts resolved — inbox showing RESOLVED notifications](docs/screenshots/292-all-issues-resolved.png)
+*AlertManager sending `[RESOLVED]` emails — all 5 alerts cleared automatically once the fixes were applied. No manual intervention needed.*
+
+![Website still working after removing the LoadBalancer service](docs/screenshots/293-website-working-after-fix.png)
+*Online Boutique at http://63.184.235.88 — unchanged. The Traefik Ingress was always what served traffic. Removing the redundant LoadBalancer had zero effect on the user-facing application.*
+
+![kubectl get pods -A clean — no Pending pods anywhere](docs/screenshots/294-kubectl-pods-success.png)
+*`kubectl get pods -A` — all namespaces, all pods Running. The `svclb-frontend-external` pod is gone. kube-system is clean.*
+
+---
+
+**What this teaches:**
+
+**1 — k3s is not standard Kubernetes.** Tools written for upstream Kubernetes (like `kube-prometheus-stack`'s default alert rules) make assumptions that don't hold on k3s. Knowing which alerts are architectural false positives vs real problems is essential when operating k3s. Always silence k3s-incompatible alerts on first setup.
+
+**2 — Two ways to expose a service can coexist silently but only one works.** The Ingress and the LoadBalancer were both pointing at the frontend service. Only Traefik was actually serving traffic. The LoadBalancer appeared configured but its pod never ran — a silent failure that only became visible through AlertManager.
+
+**3 — ArgoCD health ≠ application availability.** ArgoCD showed "Degraded" because a pod wasn't Running. The application was serving real traffic the entire time. ArgoCD's health check looks at Kubernetes object state, not end-user experience. Both signals matter — ArgoCD health tells you about infrastructure state, a direct HTTP check tells you about user-facing availability.
 
 ---
 
