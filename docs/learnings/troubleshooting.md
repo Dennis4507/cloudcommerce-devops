@@ -26,6 +26,9 @@ Every real issue encountered during this project, documented with the exact CLI 
 16. [AlertManager — undefined receiver "null" used in route](#16-alertmanager--undefined-receiver-null-used-in-route)
 17. [Node Memory Exhaustion — Full Cluster Freeze](#17-node-memory-exhaustion--full-cluster-freeze)
 18. [git push Rejected — Jenkins Pushed First](#18-git-push-rejected--jenkins-pushed-first)
+19. [ECR Token Expiry — ImagePullBackOff After 12 Hours](#19-ecr-token-expiry--imagepullbackoff-after-12-hours)
+20. [CPU Requests at 100% — Rolling Update Deadlock on Single Node](#20-cpu-requests-at-100--rolling-update-deadlock-on-single-node)
+21. [Grafana CrashLoopBackOff — Two isDefault Datasources (Permanent Fix)](#21-grafana-crashloopbackoff--two-isdefault-datasources-permanent-fix)
 
 ---
 
@@ -958,6 +961,18 @@ When `ImagePullBackOff` appears on new pods but old pods are Running:
 2. Check if the ECR token is expired: `sudo cat /etc/rancher/k3s/registries.yaml | head -5`
 3. Check when the token was last refreshed — if more than 12 hours ago, it's expired
 
+```bash
+# Read the token — it requires sudo because the file is root-owned (0600)
+sudo cat /etc/rancher/k3s/registries.yaml
+
+# You'll see the long eyJ... JWT string — this is the ECR token
+# If it was written at setup time and more than 12 hours have passed, it is expired
+# Note: you cannot check expiry from the string itself without decoding the JWT
+```
+
+![Expired ECR token visible in registries.yaml](../screenshots/264-registries-yaml-expired-token.png)
+*`sudo cat /etc/rancher/k3s/registries.yaml` — the `eyJ...` string is the ECR authentication token. A token written at cluster setup time weeks ago has long since expired. The file is root-owned (0600), which is why the permission denied error appears without `sudo` — this is correct security practice.*
+
 ### Immediate Fix — Refresh from WSL
 ```bash
 # Generate fresh token on WSL (AWS CLI is installed here, not on k3s server)
@@ -1019,6 +1034,9 @@ $ cat /var/log/ecr-refresh.log
 ```
 The 18:00:22 entry was the cron job firing automatically. The token will never expire unattended.
 
+![ECR auto-refresh cron log — automatic 18:00 entry with no human present](../screenshots/271-ecr-refresh-log.png)
+*`cat /var/log/ecr-refresh.log` — four entries total. The `18:00:22` line is the cron job firing automatically. The Ansible playbook wrote the first entry; everything after that is the scheduled job. No human involvement. The pattern repeats every 6 hours: 00:00, 06:00, 12:00, 18:00.*
+
 ### Result
 ```
 $ kubectl get pods -n online-boutique
@@ -1027,6 +1045,9 @@ adservice-65bbd8bf4d-kmmmd            1/1     Running   0          9m
 cartservice-567946bd8d-fhdgc          1/1     Running   0          9m
 # All 12 services Running — image pulls succeeding with fresh token
 ```
+
+![All 12 online-boutique pods Running after ECR token fix](../screenshots/272-all-pods-running-after-ecr-fix.png)
+*`kubectl get pods -A` — all namespaces clean. Containerd is now pulling images with a valid ECR token that the cron job will keep fresh automatically. Single clean pod generation — no ImagePullBackOff, no Pending.*
 
 ---
 
@@ -1049,6 +1070,12 @@ $ kubectl describe node | grep -A 5 "Allocated resources"
   cpu     2000m (100%)   3675m (183%)   ← node at 100% CPU requests
   memory  2520Mi (32%)   4400Mi (56%)   ← memory fine — cpu is the problem
 ```
+
+![kubectl describe pod showing Insufficient cpu scheduling failure](../screenshots/281-describe-pod-insufficient-cpu.png)
+*`kubectl describe pod adservice-new-gen` Events section — "0/1 nodes are available: 1 Insufficient cpu" with "no preemption victims found" confirms this is a Kubernetes scheduling failure, not an application error. The pod never even tried to start.*
+
+![Node CPU requests at 100% with only 15% actual usage](../screenshots/282-node-cpu-requests-100-percent.png)
+*`kubectl describe node | grep -A 10 "Allocated resources"` — CPU Requests 2000m (100%), Memory 2520Mi (32%). The node is fully reserved in CPU while almost entirely idle in reality. This is the scheduling illusion that causes the deadlock.*
 
 New pods stuck Pending for 6+ hours. Old pods Running but outdated. Rolling update completely deadlocked.
 
@@ -1125,6 +1152,9 @@ $ kubectl get pods -n online-boutique
 # Single generation, all 12 Running — rolling updates work automatically going forward
 ```
 
+![All namespaces clean — single generation, all Running after CPU right-sizing](../screenshots/286-all-pods-after-cpu-fix.png)
+*`kubectl get pods --all-namespaces` — one clean generation per service. CPU Requests dropped from 2000m (100%) to ~1100m (55%), giving the scheduler 45% headroom for rolling updates. This fix is permanent — no further manual intervention needed.*
+
 ### Why This Matters
 Setting requests equal to limits (or to arbitrary "safe" values) is a common mistake. In a team environment, requests should be set based on observed p95 usage from production metrics — not guesses. Prometheus provides this data; the Grafana dashboard makes it visible. The fix was data-driven: Prometheus showed 15% actual CPU vs 100% reserved. The requests were reduced to match reality.
 
@@ -1141,6 +1171,9 @@ $ kubectl logs -n monitoring monitoring-grafana-5479bc5f75-mfdms -c grafana --ta
 logger=provisioning level=error msg="Failed to provision data sources"
 error="Only one datasource per organization can be marked as default"
 ```
+
+![Grafana pod with 124 restarts over 3 days in CrashLoopBackOff](../screenshots/273-grafana-crashloop-check.png)
+*`kubectl get pods -n monitoring | grep grafana` — 124 restarts over 3 days. `2/3 Ready` is the tell: the two sidecar containers (sc-datasources, sc-dashboard) are healthy. Only the grafana container itself crashes on every startup attempt. This isolates the problem to Grafana's startup sequence, not the pod scheduler.*
 
 Grafana crashed 124 times over 3 days. Manual ConfigMap patches kept reverting.
 
@@ -1162,6 +1195,9 @@ kubectl get configmap -n monitoring -l grafana_datasource=1 -o yaml | grep "isDe
 # Check which version of RespectIgnoreDifferences is in the ArgoCD app
 kubectl get application loki -n argocd -o yaml | grep -A5 "syncOptions"
 ```
+
+![kubectl logs showing the exact isDefault crash message every single time](../screenshots/274-grafana-logs-isdefault-error.png)
+*`kubectl logs ... -c grafana --previous` — "Only one datasource per organization can be marked as default" prints on every startup before Grafana exits. The `--previous` flag is essential here: since the container is in CrashLoopBackOff, the current logs are from the most recent (already crashed) run. `--previous` retrieves the logs from the run before that — showing the actual crash output.*
 
 ### Fix — Disable the ConfigMap at Source
 
@@ -1189,6 +1225,9 @@ $ kubectl get pods -n monitoring | grep grafana
 monitoring-grafana-5479bc5f75-4zvm4   3/3   Running   0   74m
 # 0 restarts — Grafana starts cleanly and stays running
 ```
+
+![Grafana 3/3 Running with 0 restarts after permanent fix](../screenshots/275-grafana-running-boutique-issues.png)
+*`3/3 Running, 0 restarts` — Grafana starts cleanly and stays up. The ConfigMap that caused the conflict no longer exists because `sidecar.datasources.enabled: false` stops the loki-stack chart from creating it. This fix survives reboots, ArgoCD syncs, and cluster rebuilds.*
 
 ### Why the Previous Fix Didn't Hold
 | Approach | Why It Failed |

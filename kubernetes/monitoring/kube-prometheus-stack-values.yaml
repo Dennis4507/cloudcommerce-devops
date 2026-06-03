@@ -85,9 +85,14 @@ alertmanager:
       routes:
         # Watchdog is an always-firing heartbeat alert — suppress it
         # InfoInhibitor is a meta-alert used to silence info-level noise
+        # KubeSchedulerDown / KubeControllerManagerDown / KubeProxyDown — k3s false positives:
+        #   k3s runs scheduler + controller-manager as a single binary and does not expose
+        #   the standard scrape endpoints. kube-prometheus-stack expects upstream Kubernetes
+        #   endpoints that don't exist on k3s. These will fire forever on k3s — silence them.
+        # etcdInsufficientMembers — k3s embeds etcd differently; standard etcd endpoint missing
         - receiver: 'null'
           matchers:
-            - alertname =~ "Watchdog|InfoInhibitor"
+            - alertname =~ "Watchdog|InfoInhibitor|KubeSchedulerDown|KubeControllerManagerDown|KubeProxyDown|etcdInsufficientMembers"
 
     receivers:
       # null receiver — silently discards alerts routed to it (standard pattern)
