@@ -53,6 +53,103 @@
         delay: 10
         timeout: 60
 
+    # ---------------------------------------------------------------
+    # ECR Token Auto-Refresh
+    # Problem: ECR tokens expire after 12 hours. Without auto-refresh,
+    # image pulls fail and pods enter ImagePullBackOff after half a day.
+    # Solution: Install AWS CLI on the k3s server and add a cron job
+    # that refreshes the token every 6 hours using the EC2 IAM role.
+    # No credentials needed — the instance profile handles AWS auth.
+    # ---------------------------------------------------------------
+
+    - name: Install AWS CLI dependencies
+      apt:
+        name:
+          - unzip
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Check if AWS CLI is already installed
+      command: aws --version
+      register: aws_check
+      failed_when: false
+      changed_when: false
+
+    - name: Clean up any partial AWS CLI install
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/awscliv2.zip
+        - /tmp/aws
+      when: aws_check.rc != 0
+
+    - name: Install AWS CLI on k3s server
+      shell: |
+        set -e
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+        unzip -q /tmp/awscliv2.zip -d /tmp
+        /tmp/aws/install
+        rm -rf /tmp/awscliv2.zip /tmp/aws
+      when: aws_check.rc != 0
+
+    - name: Verify AWS CLI installed correctly
+      command: aws --version
+      changed_when: false
+
+    - name: Create ECR token refresh script
+      copy:
+        dest: /usr/local/bin/refresh-ecr-token.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Refresh ECR authentication token for k3s containerd
+          # ECR tokens expire after 12 hours — this script runs every 6 hours
+          # Uses the EC2 IAM instance profile — no hardcoded credentials needed
+          # If the token expires, k3s cannot pull images from ECR and pods
+          # enter ImagePullBackOff. This script prevents that automatically.
+
+          REGION="eu-central-1"
+
+          # Fetch AWS account ID and fresh ECR token using the IAM instance profile
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          TOKEN=$(aws ecr get-login-password --region ${REGION})
+
+          # Write fresh token to k3s registry configuration
+          cat > /etc/rancher/k3s/registries.yaml << EOF
+          configs:
+            "${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com":
+              auth:
+                username: "AWS"
+                password: "${TOKEN}"
+          EOF
+
+          # Restart k3s so containerd picks up the new token
+          systemctl restart k3s
+
+          # Log the refresh with a timestamp for audit trail
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - ECR token refreshed successfully for account ${ACCOUNT}" \
+            >> /var/log/ecr-refresh.log
+
+    - name: Run ECR token refresh script once immediately to verify it works
+      command: /usr/local/bin/refresh-ecr-token.sh
+      changed_when: true
+
+    - name: Wait for k3s to be ready after token refresh restart
+      wait_for:
+        port: 6443
+        delay: 15
+        timeout: 60
+
+    - name: Add cron job to refresh ECR token every 6 hours
+      cron:
+        name: "Refresh ECR token for k3s containerd"
+        minute: "0"
+        hour: "*/6"
+        job: "/usr/local/bin/refresh-ecr-token.sh >> /var/log/ecr-refresh.log 2>&1"
+        user: root
+
     - name: Get kubeconfig
       command: cat /etc/rancher/k3s/k3s.yaml
       register: kubeconfig

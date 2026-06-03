@@ -935,6 +935,273 @@ In large teams with CI/CD pipelines, `--rebase` is the standard.
 
 ---
 
+## 19. ECR Token Expiry — ImagePullBackOff After 12 Hours
+
+### Symptom
+```
+$ kubectl get pods -n online-boutique
+NAME                        READY   STATUS             RESTARTS   AGE
+adservice-65bbd8bf4d-rsnf6  0/1     ImagePullBackOff   0          21m
+cartservice-567946bd8d      0/1     ErrImagePull       0          21m
+```
+
+Pods were running fine, then after a rolling update triggered by a Jenkins build, new pods fail to pull images. Older pods (already running) are unaffected — they use cached images.
+
+### Root Cause
+ECR authentication tokens expire after **12 hours**. The Ansible playbook writes the token to `/etc/rancher/k3s/registries.yaml` at setup time — but never refreshes it. Containerd (k3s's container runtime) uses this static token for all image pulls. After 12 hours, ECR rejects the expired token.
+
+This only becomes visible during rolling updates — existing pods use cached images and don't need to re-pull. New pods (new image tag) must pull from ECR and hit the expired token.
+
+### Troubleshooting Methodology
+When `ImagePullBackOff` appears on new pods but old pods are Running:
+1. It's an authentication issue, not a code issue
+2. Check if the ECR token is expired: `sudo cat /etc/rancher/k3s/registries.yaml | head -5`
+3. Check when the token was last refreshed — if more than 12 hours ago, it's expired
+
+### Immediate Fix — Refresh from WSL
+```bash
+# Generate fresh token on WSL (AWS CLI is installed here, not on k3s server)
+TOKEN=$(aws ecr get-login-password --region eu-central-1 --profile cloudcommerce)
+ACCOUNT=$(aws sts get-caller-identity --profile cloudcommerce --query Account --output text)
+
+# Write to k3s server via SSH and restart k3s
+ssh -i ~/.ssh/cloudcommerce-dev-key ubuntu@63.184.235.88 "
+sudo bash -c 'cat > /etc/rancher/k3s/registries.yaml << EOF
+configs:
+  \"${ACCOUNT}.dkr.ecr.eu-central-1.amazonaws.com\":
+    auth:
+      username: \"AWS\"
+      password: \"${TOKEN}\"
+EOF'
+sudo systemctl restart k3s
+echo Done"
+```
+
+### Permanent Fix — Cron Job via Ansible
+Added to `ansible/playbooks/setup-k3s.yml`:
+```yaml
+- name: Create ECR token refresh script
+  copy:
+    dest: /usr/local/bin/refresh-ecr-token.sh
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      REGION="eu-central-1"
+      ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+      TOKEN=$(aws ecr get-login-password --region ${REGION})
+      cat > /etc/rancher/k3s/registries.yaml << EOF
+      configs:
+        "${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com":
+          auth:
+            username: "AWS"
+            password: "${TOKEN}"
+      EOF
+      systemctl restart k3s
+      echo "$(date '+%Y-%m-%d %H:%M:%S') - ECR token refreshed" >> /var/log/ecr-refresh.log
+
+- name: Add cron job to refresh ECR token every 6 hours
+  cron:
+    name: "Refresh ECR token for k3s containerd"
+    minute: "0"
+    hour: "*/6"
+    job: "/usr/local/bin/refresh-ecr-token.sh >> /var/log/ecr-refresh.log 2>&1"
+    user: root
+```
+
+The script uses the EC2 IAM instance profile — no credentials stored anywhere.
+
+### Proof it works
+```
+$ cat /var/log/ecr-refresh.log
+2026-06-03 14:42:48 - ECR token refreshed  ← Ansible playbook
+2026-06-03 18:00:22 - ECR token refreshed  ← AUTOMATIC CRON (18:00)
+2026-06-03 18:56:08 - ECR token refreshed  ← manual test
+```
+The 18:00:22 entry was the cron job firing automatically. The token will never expire unattended.
+
+### Result
+```
+$ kubectl get pods -n online-boutique
+NAME                                  READY   STATUS    RESTARTS   AGE
+adservice-65bbd8bf4d-kmmmd            1/1     Running   0          9m
+cartservice-567946bd8d-fhdgc          1/1     Running   0          9m
+# All 12 services Running — image pulls succeeding with fresh token
+```
+
+---
+
+## 20. CPU Requests at 100% — Rolling Update Deadlock on Single Node
+
+### Symptom
+```
+$ kubectl get pods -n online-boutique
+NAME                         READY   STATUS    AGE
+adservice-old-gen            1/1     Running   10d   ← old pods running
+adservice-new-gen            0/1     Pending   6h    ← new pods stuck Pending
+
+$ kubectl describe pod adservice-new-gen -n online-boutique
+Events:
+  Warning  FailedScheduling  0/1 nodes are available: 1 Insufficient cpu.
+  no new claims to deallocate, preemption: 0/1 nodes are available:
+  1 No preemption victims found for incoming pod.
+
+$ kubectl describe node | grep -A 5 "Allocated resources"
+  cpu     2000m (100%)   3675m (183%)   ← node at 100% CPU requests
+  memory  2520Mi (32%)   4400Mi (56%)   ← memory fine — cpu is the problem
+```
+
+New pods stuck Pending for 6+ hours. Old pods Running but outdated. Rolling update completely deadlocked.
+
+### Root Cause
+**CPU Requests ≠ CPU Usage.** Requests are what Kubernetes reserves for scheduling. Actual usage was ~15%, but requests were at 100%.
+
+The chart values copied from Google's production environment set requests of 100-200m per service — designed for multi-node clusters where these requests distribute across many nodes. On a single node:
+
+```
+11 services × ~140m avg = 1540m requests
+Monitoring stack:          ~400m requests
+ArgoCD + system:           ~300m requests
+Total:                     ~2240m > 2000m (already over before rolling update)
+
+During rolling update (both generations):
+1540m × 2 = 3080m for boutique alone → impossible on 2000m node
+```
+
+Rolling update rule: "Don't terminate old pod until new pod is Running." New pod can't start (no CPU request headroom). Old pod won't terminate (waiting for new pod). Permanent deadlock.
+
+### Troubleshooting Methodology
+```bash
+# Step 1 — confirm scheduling failure
+kubectl describe pod <pending-pod> -n online-boutique | tail -10
+# Look for: "Insufficient cpu" or "Insufficient memory"
+
+# Step 2 — check node allocation
+kubectl describe node | grep -A 8 "Allocated resources"
+# Look at Requests percentage — if >80%, rolling updates will struggle
+
+# Step 3 — compare requests vs actual usage in Grafana
+# Dashboard: Kubernetes → Compute Resources → Cluster
+# Compare CPU Requests column vs CPU Usage column
+# If requests >> usage, right-size the requests
+```
+
+### Fix
+Reduce CPU requests in `kubernetes/apps/online-boutique/values.yaml` based on observed Prometheus metrics:
+
+```yaml
+# Before — production values designed for multi-node clusters
+adService:
+  resources:
+    requests:
+      cpu: 200m   # reserved 200m, actually using ~5m
+
+# After — right-sized for single-node, matches observed usage
+adService:
+  resources:
+    requests:
+      cpu: 50m    # still far above actual usage (~5m), but leaves room for rolling updates
+    limits:
+      cpu: 300m   # unchanged — pod can still burst to full CPU when needed
+```
+
+Limits were left unchanged. Limits define the ceiling; requests define the floor for scheduling.
+
+After the change, one manual pod delete of the old generation was needed to break the deadlock (old pods had the old high requests in their spec — those don't change until pods are replaced):
+
+```bash
+kubectl delete pod -n online-boutique \
+  adservice-<old-hash> cartservice-<old-hash> ...  # all old Running pods
+```
+
+This freed the old reservations. New pods with lower requests scheduled immediately.
+
+### Result
+```
+$ kubectl describe node | grep -A 5 "Allocated resources"
+  cpu     1100m (55%)   3675m (183%)   ← now has headroom for rolling updates
+  memory  2520Mi (32%)  4400Mi (56%)
+
+$ kubectl get pods -n online-boutique
+# Single generation, all 12 Running — rolling updates work automatically going forward
+```
+
+### Why This Matters
+Setting requests equal to limits (or to arbitrary "safe" values) is a common mistake. In a team environment, requests should be set based on observed p95 usage from production metrics — not guesses. Prometheus provides this data; the Grafana dashboard makes it visible. The fix was data-driven: Prometheus showed 15% actual CPU vs 100% reserved. The requests were reduced to match reality.
+
+---
+
+## 21. Grafana CrashLoopBackOff — Two isDefault Datasources (Permanent Fix)
+
+### Symptom
+```
+$ kubectl get pods -n monitoring | grep grafana
+monitoring-grafana-5479bc5f75-mfdms   2/3   CrashLoopBackOff   124 (2m13s ago)   3d5h
+
+$ kubectl logs -n monitoring monitoring-grafana-5479bc5f75-mfdms -c grafana --tail=5
+logger=provisioning level=error msg="Failed to provision data sources"
+error="Only one datasource per organization can be marked as default"
+```
+
+Grafana crashed 124 times over 3 days. Manual ConfigMap patches kept reverting.
+
+### Root Cause
+The loki-stack Helm chart creates a ConfigMap called `loki-loki-stack` with `isDefault: true` — even when `grafana.enabled: false`. This ConfigMap is intended for external Grafana instances to auto-detect Loki.
+
+Meanwhile, kube-prometheus-stack also sets Prometheus as `isDefault: true`. Grafana's sidecar merges all ConfigMaps with label `grafana_datasource=1` into a single datasources file. Two `isDefault: true` values → crash.
+
+The previous fix (manual ConfigMap patch + `ignoreDifferences`) failed because `RespectIgnoreDifferences=true` was missing from ArgoCD syncOptions — so ArgoCD applied the chart-rendered version during sync, reverting the patch.
+
+### Diagnosis
+```bash
+# Find all ConfigMaps that Grafana's sidecar will pick up
+kubectl get configmap -n monitoring -l grafana_datasource=1 -o yaml | grep "isDefault"
+# isDefault: true   ← loki-loki-stack ConfigMap
+# isDefault: true   ← prometheus ConfigMap
+# Two defaults → crash
+
+# Check which version of RespectIgnoreDifferences is in the ArgoCD app
+kubectl get application loki -n argocd -o yaml | grep -A5 "syncOptions"
+```
+
+### Fix — Disable the ConfigMap at Source
+
+The cleanest fix: stop loki-stack from creating the conflicting ConfigMap at all. Since Loki is already registered as a datasource via `additionalDataSources` in kube-prometheus-stack, the loki-stack ConfigMap is redundant.
+
+```yaml
+# kubernetes/monitoring/loki-stack-values.yaml
+grafana:
+  enabled: false
+  sidecar:
+    datasources:
+      enabled: false  # ← prevents loki-loki-stack ConfigMap from being created
+```
+
+Delete the old ConfigMap manually, then ArgoCD syncs the updated loki values — the ConfigMap is gone permanently:
+
+```bash
+kubectl delete configmap loki-loki-stack -n monitoring
+kubectl delete pod -n monitoring <grafana-pod>  # restart with clean slate
+```
+
+### Result
+```
+$ kubectl get pods -n monitoring | grep grafana
+monitoring-grafana-5479bc5f75-4zvm4   3/3   Running   0   74m
+# 0 restarts — Grafana starts cleanly and stays running
+```
+
+### Why the Previous Fix Didn't Hold
+| Approach | Why It Failed |
+|----------|--------------|
+| Manual ConfigMap patch | ArgoCD reverted it on next sync |
+| ignoreDifferences (without RespectIgnoreDifferences) | Display-only — ArgoCD still applied chart values during sync |
+| ignoreDifferences + RespectIgnoreDifferences | Prevented reversion — but ConfigMap still existed with potential to conflict |
+| Disable sidecar.datasources ← this fix | ConfigMap never created — nothing to conflict |
+
+The root fix disables the source of the conflict rather than patching its output.
+
+---
+
 ## General Troubleshooting Methodology
 
 ### The Diagnostic Ladder

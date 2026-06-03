@@ -3187,6 +3187,9 @@ In production, this pipeline means an engineer gets paged when something breaks 
 - [x] Fix Go stdlib CVEs across all 4 Go services — upgrade base image golang:1.26.2 → golang:1.26.3
 - [x] Fix CRITICAL gRPC CVE in shippingservice — upgrade grpc v1.79.2 → v1.79.3 via go.mod
 - [x] Fix HIGH opentelemetry CVE in shippingservice — upgrade otel v1.39.0 → v1.43.0 via go.mod
+- [x] Fix Grafana CrashLoopBackOff (124 restarts) — disabled loki-stack sidecar datasource ConfigMap permanently
+- [x] Fix rolling update deadlock — right-sized CPU requests from 1500m → 550m based on Prometheus metrics
+- [x] Fix ECR token expiry — added auto-refresh cron job to k3s Ansible playbook, token refreshes every 6 hours
 - [ ] Fix remaining Node.js and Python CVEs
 - [ ] Configure HPA — Horizontal Pod Autoscaler
 - [ ] Write k6 load test scripts and run under live traffic
@@ -3506,6 +3509,216 @@ The AWS CLI user (`github-actions-deploy`) only has ECR permissions — correctl
 | New engineer rebuilds cluster | ❌ Needs password from someone | ✅ Auto-recreated |
 | Secret rotation | ❌ Manual kubectl update | ✅ Update in AWS, ESO syncs within 1h |
 | Audit trail | ❌ None | ✅ AWS CloudTrail logs every access |
+
+---
+
+### Incident 4 — Grafana CrashLoopBackOff (124 Restarts Over 3 Days)
+
+**What happened in simple terms:**
+
+Two Helm charts both claimed to be the "default" datasource in Grafana. Grafana has a hard rule — only one datasource can be the default. Every time Grafana started, it read both configs, saw two defaults, and crashed immediately. This happened 124 times over 3 days.
+
+**Root cause:**
+
+The `loki-stack` Helm chart creates a Kubernetes ConfigMap (`loki-loki-stack`) automatically — even when `grafana.enabled: false`. This ConfigMap is designed for external Grafana instances to detect Loki as a datasource. It sets `isDefault: true`. Meanwhile, `kube-prometheus-stack` also sets Prometheus as `isDefault: true`. Grafana's sidecar collected both ConfigMaps and tried to provision both as default — refusing to start.
+
+```
+loki-loki-stack ConfigMap:    isDefault: true  ← from loki-stack chart
+prometheus ConfigMap:         isDefault: true  ← from kube-prometheus-stack
+Grafana sees:                 TWO defaults → crash
+```
+
+**Diagnosis:**
+
+![Grafana CrashLoop check](docs/screenshots/273-grafana-crashloop-check.png)
+*`kubectl get pods -n monitoring | grep grafana` — 124 restarts over 3 days. 2/3 ready means the grafana container itself is failing; the two sidecar containers are running.*
+
+![Grafana logs isDefault error](docs/screenshots/274-grafana-logs-isdefault-error.png)
+*`kubectl logs` — "Only one datasource per organization can be marked as default." The exact error that caused every crash.*
+
+![Grafana unreachable](docs/screenshots/297-grafana-unreachable.png)
+*Grafana UI unreachable during the crash loop — the pod restarts too quickly to serve any requests.*
+
+**Why the previous manual patch kept failing:**
+
+The first fix patched the ConfigMap manually (`sed -i 's/isDefault: true/isDefault: false/'`). But ArgoCD's `selfHeal: true` reverted it on every sync. `ignoreDifferences` was added to prevent reversion — but `RespectIgnoreDifferences=true` was missing from syncOptions, so ArgoCD respected the ignoreDifferences for display only, not during actual sync operations.
+
+**The permanent fix — disable the ConfigMap at source:**
+
+Since we already configure Loki as a datasource via `additionalDataSources` in kube-prometheus-stack, the loki-stack ConfigMap is redundant. The fix: tell loki-stack to stop creating it.
+
+```yaml
+# kubernetes/monitoring/loki-stack-values.yaml
+grafana:
+  enabled: false
+  sidecar:
+    datasources:
+      enabled: false  # ← stops the ConfigMap from being created entirely
+```
+
+![Grafana running after fix](docs/screenshots/275-grafana-running-boutique-issues.png)
+*`monitoring-grafana 3/3 Running 0 restarts` — Grafana starts cleanly. The sidecar datasource ConfigMap no longer exists, no conflict.*
+
+---
+
+### Incident 5 — Rolling Update Deadlock: CPU Requests at 100%
+
+**What happened in simple terms:**
+
+After Jenkins pushed new images, ArgoCD tried to roll out updated pods. But the node was completely full — not in terms of actual CPU usage (which was only ~15%), but in terms of CPU **reservations**. Kubernetes couldn't place new pods alongside old pods, and old pods wouldn't terminate until new pods were running. Complete deadlock for 6+ hours.
+
+**The CPU requests vs CPU usage distinction:**
+
+```
+CPU Requests = seats reserved on the train (used for scheduling)
+CPU Usage    = passengers actually sitting
+
+All 2000 seats reserved (100%) → no new passengers allowed
+Actual passengers: ~300 (15%) → train is mostly empty
+Scheduler: "train is full, no new pods"
+```
+
+**Diagnosis:**
+
+![ImagePullBackOff and pending](docs/screenshots/279-imagepullbackoff-and-pending.png)
+*Initial state — new pods Pending, old pods stuck in ImagePullBackOff. Neither generation can progress.*
+
+![Worse state with ErrImagePull](docs/screenshots/280-errimagepull-worse-state.png)
+*After attempted fixes — ErrImagePull, ImagePullBackOff, and Pending simultaneously. Multiple pod generations stacking.*
+
+![kubectl describe pod insufficient CPU](docs/screenshots/281-describe-pod-insufficient-cpu.png)
+*`kubectl describe pod adservice` — Events section showing the exact error: "0/1 nodes are available: 1 Insufficient cpu." This is the scheduling failure, not an application error.*
+
+![Node CPU requests 100%](docs/screenshots/282-node-cpu-requests-100-percent.png)
+*`kubectl describe node | grep -A 10 "Allocated resources"` — CPU Requests: 2000m (100%). Memory: 2520Mi (32%). CPU is the constraint, not memory.*
+
+![Rolling update CPU math](docs/screenshots/283-rolling-update-cpu-math.png)
+*The calculation showing why rolling updates fail: 1500m (old generation) + 1500m (new generation) = 3000m required, 2000m available. Impossible.*
+
+![Rolling update strategy check](docs/screenshots/284-rolling-update-strategy-check.png)
+*`kubectl get deployment adservice -o yaml | grep -A5 "strategy"` — RollingUpdate with maxSurge 25% (rounds up to 1). On a 1-replica deployment, this means 2 pods simultaneously during rollout.*
+
+**The fix — right-size CPU requests based on observed Prometheus data:**
+
+Prometheus showed actual CPU usage was ~15% while requests were at 100%. The requests were copied from Google's production values designed for multi-node clusters. On a single node, they need to reflect actual usage.
+
+| Service | Before | After |
+|---------|--------|-------|
+| adservice | 200m | 50m |
+| cartservice | 200m | 50m |
+| loadgenerator | 300m | 100m |
+| all others | 100m each | 50m each |
+| **Total** | **1500m** | **550m** |
+
+With 550m per generation, two generations during rollout = 1100m. Plus monitoring (~700m) = 1800m total — fits within 2000m with 200m headroom.
+
+![Pods watch after CPU fix](docs/screenshots/285-pods-watch-after-cpu-fix.png)
+*`kubectl get pods -n online-boutique -w` — after applying lower CPU requests, new generation pods begin scheduling and transitioning to Running.*
+
+![All pods after CPU fix](docs/screenshots/286-all-pods-after-cpu-fix.png)
+*All namespaces — single clean generation of pods, all Running. The deadlock is permanently resolved.*
+
+**Why one manual pod delete was still needed:**
+
+Even after lowering the requests in values.yaml, the currently-running old pods were created with the old high requests (those reservations don't change until the pods are replaced). A one-time manual delete of the old generation freed the reservations, allowing the new lower-request pods to schedule. This is the last time manual intervention was needed — future rolling updates work automatically.
+
+![Final manual pod delete](docs/screenshots/287-final-manual-pod-delete.png)
+*Manual deletion of old generation pods — freeing 1500m of CPU reservations so the new 550m-request pods can start.*
+
+---
+
+### Incident 6 — ECR Token Expiry: ImagePullBackOff After 12 Hours
+
+**What happened in simple terms:**
+
+AWS ECR requires authentication to pull private images. The authentication token is temporary — it expires after 12 hours. The Ansible playbook writes this token to `registries.yaml` on the k3s server at setup time, but never refreshes it. After 12 hours, containerd (k3s's container runtime) tried to pull images from ECR with an expired token, ECR rejected it, and pods entered ImagePullBackOff.
+
+**Why this only manifested now:**
+
+The cluster ran continuously without issue because pods were already running from cached images. The token expiry only became visible when a new rolling update tried to pull fresh images from ECR.
+
+**The file that holds the token:**
+
+`/etc/rancher/k3s/registries.yaml` on the k3s EC2 server:
+
+```yaml
+configs:
+  "927311782753.dkr.ecr.eu-central-1.amazonaws.com":
+    auth:
+      username: "AWS"
+      password: "eyJwYXlsb2FkIjoiQ..."   ← this expires after 12 hours
+```
+
+![Permission denied reading registries.yaml](docs/screenshots/263-registries-yaml-permission-denied.png)
+*`cat /etc/rancher/k3s/registries.yaml` returns permission denied — the file is root-owned (0600). Correct security practice: only k3s (running as root) should read the ECR token.*
+
+![Registries.yaml showing expired token](docs/screenshots/264-registries-yaml-expired-token.png)
+*`sudo cat /etc/rancher/k3s/registries.yaml` — the long `eyJ...` string is the expired ECR token. This same token was written weeks ago by the Ansible playbook.*
+
+**Immediate fix — refresh the token from WSL:**
+
+AWS CLI is not installed on the k3s server (only on Jenkins). The token was generated on WSL (where AWS CLI is configured with the cloudcommerce profile) and piped directly to the k3s server via SSH:
+
+![WSL SSH token refresh command](docs/screenshots/296-wsl-ssh-token-refresh-command.png)
+*WSL terminal — generating fresh ECR token locally and writing it to the k3s server in one SSH command. No AWS CLI needed on the k3s server itself.*
+
+![k3s restarted with fresh token](docs/screenshots/295-k3s-restarted-fresh-token.png)
+*"Done — k3s restarted with fresh ECR token" — the SSH command completed, k3s picked up the new token.*
+
+**The permanent fix — cron job via Ansible:**
+
+A manual refresh every 12 hours is not sustainable. The proper fix: install AWS CLI on the k3s server and add a cron job that auto-refreshes the token every 6 hours using the EC2 IAM instance profile (no credentials stored anywhere).
+
+The k3s Ansible playbook was updated with four new tasks:
+1. Install AWS CLI on k3s server
+2. Create `/usr/local/bin/refresh-ecr-token.sh`
+3. Run the script immediately to verify it works
+4. Add a cron job: `0 */6 * * *` (runs at 00:00, 06:00, 12:00, 18:00)
+
+![Setup k3s playbook in VS Code](docs/screenshots/265-setup-k3s-playbook-vscode.png)
+*Updated `setup-k3s.yml` in VS Code — new ECR auto-refresh section visible at the bottom of the playbook.*
+
+![Ansible k3s playbook running](docs/screenshots/266-ansible-k3s-playbook-running.png)
+*Ansible playbook running — k3s install skipped (already installed, `creates:` guard), AWS CLI check, script creation, and cron job tasks executing.*
+
+![Ansible cron job task](docs/screenshots/267-ansible-cron-job-task.png)
+*"Add cron job to refresh ECR token every 6 hours" task — `ok` status means cron job was already in place from the playbook run.*
+
+![AWS CLI on k3s server](docs/screenshots/268-aws-cli-on-k3s-server.png)
+*`aws --version` on the k3s server — `aws-cli/2.34.60` installed. The server can now fetch ECR tokens autonomously using its IAM instance profile.*
+
+![ECR refresh script](docs/screenshots/269-ecr-refresh-script.png)
+*`cat /usr/local/bin/refresh-ecr-token.sh` — the script fetches the AWS account ID and ECR token using the IAM role, writes them to registries.yaml, restarts k3s, and logs with a timestamp.*
+
+![Cron job configured](docs/screenshots/270-crontab-ecr-refresh.png)
+*`sudo crontab -l` — `0 */6 * * *` runs the refresh script at midnight, 6am, noon, and 6pm every day.*
+
+**Proof the automation works:**
+
+![ECR refresh log](docs/screenshots/271-ecr-refresh-log.png)
+*`cat /var/log/ecr-refresh.log` — four successful refresh entries. The `18:00:22` entry was the automatic cron job firing at 6pm — no human intervention. The token will never expire unattended again.*
+
+```
+2026-06-03 14:42:48 - ECR token refreshed  ← Ansible playbook first run
+2026-06-03 18:00:22 - ECR token refreshed  ← AUTOMATIC CRON JOB at 18:00
+2026-06-03 18:56:08 - ECR token refreshed  ← manual verification run
+2026-06-03 19:21:23 - ECR token refreshed  ← manual verification run
+2026-06-03 19:23:00 - ECR token refreshed  ← manual verification run
+```
+
+**Final state — all pods clean:**
+
+![All pods running after ECR fix](docs/screenshots/272-all-pods-running-after-ecr-fix.png)
+*`kubectl get pods -A` — all namespaces, all pods Running. Single generation. No ImagePullBackOff. No Pending. The cluster is stable.*
+
+**What this teaches:**
+
+ECR tokens are deliberately temporary (12 hours) for security — a stolen token stops working soon. But that security feature requires automation to compensate. In production this is handled by:
+- **ECR Credential Helper** — a Docker plugin that transparently refreshes tokens
+- **IAM Roles for Service Accounts (IRSA)** — Kubernetes-native AWS auth for EKS
+- **Cron-based refresh** — what we implemented here (appropriate for k3s without IRSA support)
+
+The EC2 IAM instance profile is the key — it lets the k3s server authenticate with AWS without any stored credentials. The script runs `aws ecr get-login-password` which hits the instance metadata service at `169.254.169.254` to get temporary credentials from the IAM role. No access keys. No secrets in files.
 
 ---
 
