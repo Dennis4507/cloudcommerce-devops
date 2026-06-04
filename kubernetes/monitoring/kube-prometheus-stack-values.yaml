@@ -29,9 +29,18 @@ grafana:
       isDefault: false
 
 prometheus:
+  # Expose Prometheus on NodePort 30090 so k6 can write metrics to it from WSL
+  service:
+    type: NodePort
+    nodePort: 30090
+
   prometheusSpec:
     # How long to keep metrics data
     retention: 7d
+
+    # Enable remote write receiver — allows k6 to push metrics into Prometheus
+    # k6 uses: K6_PROMETHEUS_RW_SERVER_URL=http://63.184.235.88:30090/api/v1/write
+    enableRemoteWriteReceiver: true
 
     resources:
       requests:
