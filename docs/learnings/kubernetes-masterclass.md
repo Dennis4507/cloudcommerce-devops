@@ -1150,6 +1150,731 @@ Things that would complete the picture for production:
 
 ---
 
+## Part 12 — Networking Deep Dive
+
+Networking is the hardest part of Kubernetes to understand because it has three completely separate layers, each solving a different problem. Most people mix them up. Here they are clearly separated.
+
+---
+
+### The Three Networking Layers
+
+```
+Layer 1 — Pod Networking (CNI)
+  Every pod gets a unique IP. Pods can talk directly to each other across nodes.
+  "How do pods communicate?"
+
+Layer 2 — Service Networking (kube-proxy / iptables)
+  A stable virtual IP that load-balances to pods by label.
+  "How do pods find each other reliably?"
+
+Layer 3 — External Networking (Ingress / LoadBalancer)
+  How traffic from outside the cluster reaches pods.
+  "How do users reach the application?"
+```
+
+---
+
+### Layer 1 — Pod Networking (CNI)
+
+Every pod gets its own IP address from a private CIDR range (in k3s: `10.42.0.0/16`). This means:
+- Pod A can send a packet directly to Pod B using Pod B's IP
+- This works across nodes (Pod A on Node 1 can reach Pod B on Node 2 directly)
+- The CNI plugin (Flannel, Calico, Cilium) makes this work by managing routing between nodes
+
+```
+Node 1 (10.0.1.23)               Node 2 (10.0.1.24)
+┌──────────────────────┐         ┌──────────────────────┐
+│ frontend  10.42.0.10 │         │ cartservice 10.42.1.5 │
+│ redis     10.42.0.11 │         │ checkout    10.42.1.6 │
+└──────────┬───────────┘         └──────────┬───────────┘
+           │                                │
+     Node network bridge               Node network bridge
+           └──────────── VPC / Overlay ────┘
+```
+
+**What CNI actually does:**
+1. When a pod is created, CNI creates a virtual network interface inside it
+2. That interface is connected to the node's network bridge
+3. The CNI plugin adds routing rules so packets to `10.42.1.x` go to Node 2
+4. Pod A sends a packet to `10.42.1.5` → routing rule → Node 2 → delivered to cartservice
+
+**In your project:** Every pod IP you see in k9s (`10.42.0.xxx`) is assigned by Flannel (k3s's default CNI). All pods on your single node share the same prefix because there's only one node.
+
+---
+
+### Layer 2 — Service Networking and kube-proxy
+
+Here's the problem: if Pod A talks to Pod B directly using its IP, and Pod B dies and is replaced by Pod C with a different IP, Pod A breaks. Services solve this.
+
+**How a Service actually works:**
+
+```
+1. You create a Service with selector: app=cartservice
+2. The Endpoints controller watches for pods matching that label
+3. It creates an Endpoints object: {10.42.0.50, 10.42.0.51} (the current pod IPs)
+4. kube-proxy on every node reads the Endpoints object
+5. kube-proxy writes iptables rules:
+   "any packet going to 10.43.0.15:80 → randomly pick 10.42.0.50:7070 or 10.42.0.51:7070"
+6. The Service IP (10.43.0.15) is virtual — no actual machine has this IP
+7. The packet is intercepted by iptables before it leaves the node and redirected to a real pod
+```
+
+**The Service IP is virtual.** There is no machine with IP `10.43.x.x`. When you send a packet to a Service IP, iptables intercepts it and rewrites the destination to one of the actual pod IPs. This happens transparently — the application thinks it's talking directly to `10.43.x.x` but the packet actually goes to a pod.
+
+```
+cartservice sends: GET 10.43.0.15:80 (Service IP for frontend)
+     ↓
+iptables intercepts packet on the node
+     ↓
+iptables rule: 10.43.0.15:80 → randomly pick a pod endpoint
+     ↓
+packet rewritten: destination changed to 10.42.0.50:8080 (actual pod IP)
+     ↓
+packet delivered to frontend pod
+```
+
+**Why kube-proxy exists:** It is the process that keeps the iptables rules up to date as pods come and go. When a new pod starts (matching the Service selector), kube-proxy adds it to the rules. When a pod dies, kube-proxy removes it. On k3s, this role is handled by Traefik and the built-in routing — not a separate kube-proxy process.
+
+---
+
+### CoreDNS — How Service Names Resolve to IPs
+
+CoreDNS runs as a pod in `kube-system`. It is the DNS server for the entire cluster. Every pod is automatically configured to use it.
+
+```
+Inside a pod, /etc/resolv.conf contains:
+  nameserver 10.43.0.10     ← this is the CoreDNS Service IP
+  search online-boutique.svc.cluster.local svc.cluster.local cluster.local
+```
+
+When the checkoutservice pod sends a request to `http://cartservice:7070`:
+
+```
+1. OS looks up "cartservice" in DNS
+2. CoreDNS receives the query
+3. CoreDNS checks its records:
+   cartservice.online-boutique.svc.cluster.local = 10.43.0.25
+4. Returns 10.43.0.25 to the caller
+5. OS connects to 10.43.0.25:7070 (the Service virtual IP)
+6. iptables rewrites to the actual pod IP (see above)
+```
+
+**The search domain magic:** Because `/etc/resolv.conf` has `search online-boutique.svc.cluster.local`, you can use short names within the same namespace:
+```
+http://cartservice          → resolves (same namespace search appended)
+http://cartservice.online-boutique  → resolves
+http://loki.monitoring      → resolves (cross-namespace short form)
+http://loki.monitoring.svc.cluster.local  → always resolves (full form)
+```
+
+**Debugging DNS:**
+```bash
+# From inside a pod — test DNS resolution
+nslookup cartservice.online-boutique.svc.cluster.local
+
+# Check CoreDNS logs if DNS is broken
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=20
+
+# Test from within a running pod
+kubectl exec -it <any-pod> -n online-boutique -- sh
+# then: nslookup cartservice  or  wget -qO- http://cartservice:7070/health
+```
+
+---
+
+### The Complete Traffic Flow — Browser to Pod
+
+This is the full path every user request takes in your cluster:
+
+```
+User's browser types: http://63.184.235.88
+         ↓
+1. DNS resolves 63.184.235.88 (your Elastic IP — no DNS needed, direct IP)
+         ↓
+2. HTTP request arrives at the EC2 node on port 80
+         ↓
+3. Traefik (IngressController) is listening on port 80
+   Traefik was put there by the svclb-traefik pod binding HostPort 80
+         ↓
+4. Traefik reads Ingress rules:
+   "path / → service frontend port 80"
+         ↓
+5. Traefik looks up the frontend Service endpoints
+   (the Endpoints object contains the current pod IPs)
+         ↓
+6. Traefik forwards the request to a frontend pod IP directly
+   (Traefik bypasses iptables and uses the pod IP directly — more efficient)
+         ↓
+7. Frontend pod processes the request
+   Frontend calls other services using DNS names:
+   "http://cartservice:7070" → CoreDNS → Service IP → iptables → cart pod
+         ↓
+8. Response travels back through Traefik to the user's browser
+```
+
+---
+
+### East-West vs North-South Traffic
+
+These terms describe direction of traffic in a cluster:
+
+```
+North-South:  Traffic entering or leaving the cluster
+              (user → Ingress → pod, or pod → external API)
+              Managed by: Ingress controllers, LoadBalancer services, egress rules
+
+East-West:    Traffic between pods inside the cluster
+              (frontend → cartservice → Redis)
+              Managed by: Services, DNS, NetworkPolicies
+```
+
+**Why it matters:** North-south traffic goes through the Ingress controller (Traefik) which can do TLS termination, rate limiting, auth. East-west traffic goes pod-to-pod via Services, often over plain HTTP inside the cluster. A Service Mesh (Istio/Linkerd) adds encryption and observability to east-west traffic — because inside the cluster doesn't mean inside the firewall is safe.
+
+---
+
+### Service Mesh — What It Is and Why You'd Use It
+
+A Service Mesh is an infrastructure layer that handles all east-west communication between services. The most used: **Istio** (complex, powerful) and **Linkerd** (simpler, faster).
+
+**How it works:** A sidecar container (Envoy proxy) is injected into every pod automatically. All network traffic in and out of the pod goes through the sidecar, not directly. The sidecar handles:
+
+```
+Without Service Mesh:
+  frontend pod → cartservice pod (plain HTTP, no visibility)
+
+With Service Mesh (Istio):
+  frontend pod → Envoy sidecar → mTLS encrypted tunnel → Envoy sidecar → cartservice pod
+                      ↓                                         ↓
+                 telemetry                                  telemetry
+                 (Jaeger/Zipkin for distributed tracing)
+```
+
+**What you get:**
+- **mTLS everywhere** — all east-west traffic encrypted and authenticated automatically
+- **Distributed tracing** — see the full request path across all microservices
+- **Traffic management** — canary deployments, circuit breakers, retries, timeouts
+- **Observability** — metrics for every service-to-service call
+
+**Why you don't always need it:** Service meshes add latency (two extra network hops per request), operational complexity, and resource overhead. For most applications, a good ingress controller + NetworkPolicies is enough. Use a service mesh when you need fine-grained traffic control or zero-trust networking at the pod level.
+
+**Distributed tracing** is the one thing a service mesh gives you that nothing else can replace: when a user request touches 8 microservices and something is slow, you need to know which hop added the latency. Your project's Loki gives you logs; Prometheus gives you metrics. Traces are the third pillar — and the missing one.
+
+---
+
+## Part 13 — Other Workload Types
+
+Deployments are not the only way to run containers. Four other workload types exist, each solving a different problem.
+
+---
+
+### StatefulSet — Ordered, Stable-Identity Pods
+
+**When to use:** Databases, message queues, anything where pods need:
+- A stable, predictable name (not a random hash)
+- Stable storage that follows the pod
+- Ordered startup and shutdown
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres        # must have a matching Headless Service
+  replicas: 3
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:        # each pod gets its OWN PVC
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 10Gi
+```
+
+**Deployment vs StatefulSet:**
+
+| Feature | Deployment | StatefulSet |
+|---|---|---|
+| Pod names | `frontend-7d9f8c-abc` (random) | `postgres-0`, `postgres-1`, `postgres-2` (stable) |
+| Storage | Shared or none | Each pod gets its own PVC that follows it |
+| Startup order | All at once | Sequential: 0 starts first, then 1, then 2 |
+| Shutdown order | All at once | Reverse sequential: 2 first, then 1, then 0 |
+| Rollout | Random pod replacement | Sequential replacement (0 first) |
+| Use case | Stateless apps | Databases, Kafka, ZooKeeper, Elasticsearch |
+
+**In your project:** Loki runs as a StatefulSet (`loki-0`). Prometheus runs as a StatefulSet (`prometheus-monitoring-...-0`). AlertManager runs as a StatefulSet. This is why deleting the StatefulSet and letting ArgoCD recreate it was the correct fix for the stuck Loki pod — not just deleting the pod.
+
+---
+
+### DaemonSet — One Pod Per Node
+
+**When to use:** Anything that needs to run on every node — log collectors, monitoring agents, network plugins, storage drivers.
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: promtail
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: promtail
+  template:
+    spec:
+      containers:
+      - name: promtail
+        image: grafana/promtail
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log         # read all container logs from the node
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log              # mounts the actual node filesystem
+```
+
+**How it works:** When a new node joins the cluster, Kubernetes automatically creates a DaemonSet pod on it. When a node is removed, the pod is deleted. You never specify replicas — the count is always equal to the number of nodes.
+
+**In your project:** Promtail runs as a DaemonSet (`loki-promtail-cpgpm` in k9s). It runs on every node and reads all container logs from the node filesystem, shipping them to Loki. The Prometheus node-exporter also runs as a DaemonSet — one per node to collect host-level metrics. Klipper ServiceLB (`svclb-traefik`) is a DaemonSet too.
+
+---
+
+### Job — Run to Completion
+
+**When to use:** Database migrations, batch processing, one-time scripts, backup jobs. Anything that should run once and finish.
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migration
+spec:
+  template:
+    spec:
+      containers:
+      - name: migration
+        image: my-app:latest
+        command: ["python", "manage.py", "migrate"]
+      restartPolicy: OnFailure    # restart if it fails, but don't restart after success
+  backoffLimit: 3                 # try up to 3 times before marking as Failed
+```
+
+**Job vs Deployment:**
+- Deployment: pod should run forever, restart if it exits
+- Job: pod should run once, complete successfully, then stop
+
+**Parallelism:**
+```yaml
+spec:
+  completions: 10      # we need 10 successful completions total
+  parallelism: 3       # run 3 pods at a time
+```
+Useful for processing 10 files in parallel using 3 workers.
+
+---
+
+### CronJob — Scheduled Jobs
+
+**When to use:** Periodic tasks — database backups, cache warming, report generation, token refresh (like your ECR cron job, but as a Kubernetes object).
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ecr-token-refresh
+spec:
+  schedule: "0 */6 * * *"        # every 6 hours (same as your cron job)
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: refresh
+            image: amazon/aws-cli
+            command:
+            - /bin/sh
+            - -c
+            - |
+              TOKEN=$(aws ecr get-login-password --region eu-central-1)
+              kubectl create secret docker-registry ecr-creds \
+                --docker-server=$ECR_REGISTRY \
+                --docker-username=AWS \
+                --docker-password=$TOKEN \
+                --dry-run=client -o yaml | kubectl apply -f -
+          restartPolicy: OnFailure
+  successfulJobsHistoryLimit: 3   # keep last 3 successful job records
+  failedJobsHistoryLimit: 1       # keep last failed job record
+```
+
+**Cron syntax reminder:**
+```
+"0 */6 * * *"
+ ↑  ↑   ↑ ↑ ↑
+ │  │   │ │ └── day of week (0=Sunday)
+ │  │   │ └──── month
+ │  │   └────── day of month
+ │  └────────── hour (*/6 = every 6 hours)
+ └───────────── minute (0 = at the top of the hour)
+```
+
+---
+
+### Init Containers — Setup Before Main Container
+
+**When to use:** Anything that must complete before your main application starts:
+- Wait for a database to be ready
+- Pull config from a secret manager
+- Set permissions on a mounted volume
+- Run a migration
+
+```yaml
+spec:
+  initContainers:
+  - name: wait-for-db
+    image: busybox
+    command: ['sh', '-c', 'until nc -z postgres:5432; do echo waiting; sleep 2; done']
+    # this runs and MUST SUCCEED before the main container starts
+
+  - name: run-migration
+    image: my-app:latest
+    command: ['python', 'manage.py', 'migrate']
+    # this runs after wait-for-db succeeds
+
+  containers:
+  - name: app                    # this starts only after ALL init containers succeed
+    image: my-app:latest
+```
+
+**Rules:**
+- Init containers run sequentially (one at a time, in order)
+- All init containers must exit with code 0 before main containers start
+- If an init container fails, Kubernetes restarts it until it succeeds
+- Init containers can have different images from the main container (e.g., use a `busybox` image just for the wait script)
+
+**In your project:** When kube-prometheus-stack installs, it uses an init container that generates TLS certificates for the Prometheus admission webhook before the main Prometheus pod starts.
+
+---
+
+### Sidecar Containers — Helpers Running Alongside Main Container
+
+A sidecar is a regular container in the same pod as the main application. It runs simultaneously and shares the same network and volumes.
+
+```yaml
+spec:
+  containers:
+  - name: app                    # main application
+    image: my-app:latest
+
+  - name: log-shipper            # sidecar — runs at the same time
+    image: fluentbit:latest
+    volumeMounts:
+    - name: app-logs
+      mountPath: /var/log/app
+```
+
+**Common sidecar patterns:**
+- **Log shipper** — reads logs written by the main app and ships them (Fluentbit, Logstash)
+- **Proxy** — all network traffic goes through the sidecar (Envoy in Istio service mesh)
+- **Secret refresher** — watches for secret updates and refreshes the main app's config
+- **Metrics collector** — collects custom metrics from the main app and exposes them to Prometheus
+
+**In your project:** Grafana's pod has 3 containers (`3/3 Running`): the main grafana container, `grafana-sc-datasources` (sidecar that watches for datasource ConfigMaps), and `grafana-sc-dashboard` (sidecar that watches for dashboard ConfigMaps). The sidecars are what give Grafana its "automatic datasource discovery" feature. When the ConfigMap conflict caused Grafana to crash, it was only the main container failing — you could see this because the pod showed `2/3 Ready` instead of `3/3`.
+
+---
+
+## Part 14 — Troubleshooting (The Systematic Approach)
+
+This is the framework to use for every problem you encounter. Never guess. Always follow the layers.
+
+---
+
+### The Diagnostic Ladder
+
+Work from the outside in. Never skip a level.
+
+```
+Level 1 — Can I reach the cluster?
+  kubectl get nodes
+  → Not working? Fix connectivity first. Nothing else matters.
+
+Level 2 — What is the current state?
+  kubectl get pods -A
+  kubectl get events -A --sort-by=.lastTimestamp | tail -30
+  → These two commands together answer 70% of problems.
+
+Level 3 — Why is that specific thing broken?
+  kubectl describe <resource> <name> -n <namespace>
+  kubectl logs <pod> -n <namespace> --previous
+  → Events section in describe is where Kubernetes explains itself.
+
+Level 4 — What does the application say?
+  kubectl logs <pod> -n <namespace> --tail=50
+  kubectl exec -it <pod> -n <namespace> -- sh
+  → Only go here once you know which pod and what kind of problem.
+
+Level 5 — What does the node say?
+  kubectl top pods -A
+  kubectl describe node
+  → Resource pressure, disk pressure, node conditions.
+```
+
+---
+
+### Reading Pod Status — The Decision Tree
+
+```
+PENDING
+├── kubectl describe pod → Events section
+├── "Insufficient cpu/memory" → node is full
+│   └── kubectl describe node → check Requests %
+│       ├── >90% → reduce requests or resize node
+│       └── Low % but Pending → check taints/nodeSelector
+├── "HostPort conflict" → another pod owns that port
+│   └── change service type or different port
+└── No events → pod just created, wait 30 seconds
+
+CRASHLOOPBACKOFF
+├── kubectl logs <pod> --previous
+├── "OOMKilled" in describe → memory limit too low
+│   └── increase memory limit
+├── Application error in logs → fix the application config
+├── "Config error" / "file not found" → ConfigMap/Secret not mounted correctly
+│   └── kubectl describe pod → check Volumes and Mounts sections
+└── "Two defaults" / provisioning error → datasource conflict (Grafana issue)
+
+IMAGEPULLBACKOFF / ERRIMAGEPULL
+├── kubectl describe pod → Events section → read the EXACT error
+├── "no basic auth credentials" → ECR token expired
+│   └── refresh token: aws ecr get-login-password → registries.yaml → restart k3s
+├── "manifest unknown" → image tag doesn't exist in registry
+│   └── check values.yaml → check Jenkins built and pushed that exact tag
+├── "repository does not exist" → wrong ECR repo name
+│   └── check images.repository in values.yaml
+└── "pull access denied" → IAM role missing ECR permission
+
+RUNNING but site is DOWN (503/504/connection refused)
+├── kubectl get svc -n <namespace> → service exists? right port?
+├── kubectl get ingress -n <namespace> → ingress rule exists? has address?
+├── kubectl get endpoints -n <namespace> → are there any pod IPs listed?
+│   └── Empty endpoints = no pods match the service selector
+│       → check selector in service vs labels on pods (exact match required)
+└── kubectl exec into a pod → test connectivity directly
+    wget -qO- http://<service>.<namespace>.svc.cluster.local:<port>
+
+TERMINATING (stuck)
+└── kubectl delete pod <name> -n <namespace> --force --grace-period=0
+    (pod is stuck because finalizers aren't being cleared)
+
+OOMKILLED
+├── kubectl describe pod → look for "OOMKilled" in Last State
+└── increase memory limit in the deployment/helm values
+    limits:
+      memory: 256Mi  →  512Mi
+```
+
+---
+
+### The 10 Most Useful Debugging Commands
+
+```bash
+# 1. The first two commands — run together always
+kubectl get pods -A
+kubectl get events -A --sort-by=.lastTimestamp | tail -30
+
+# 2. Why is this pod broken? (ALWAYS read the Events section at the bottom)
+kubectl describe pod <name> -n <namespace>
+
+# 3. What did the app print before it crashed?
+kubectl logs <pod> -n <namespace> --previous --tail=50
+
+# 4. Live log stream (watch as it happens)
+kubectl logs <pod> -n <namespace> -f
+
+# 5. Is the node out of resources?
+kubectl describe node | grep -A 8 "Allocated resources"
+
+# 6. What is actually being used right now?
+kubectl top pods -A
+kubectl top nodes
+
+# 7. Test network connectivity from inside the cluster
+kubectl exec -it <any-running-pod> -n <namespace> -- wget -qO- http://<service>:port/health
+
+# 8. See the actual spec of a resource (what Kubernetes has, not what you think it has)
+kubectl get deployment <name> -n <namespace> -o yaml
+
+# 9. Watch pod states change in real time
+kubectl get pods -n <namespace> -w
+
+# 10. Force delete a stuck terminating pod
+kubectl delete pod <name> -n <namespace> --force --grace-period=0
+```
+
+---
+
+### Debugging Networking Specifically
+
+```bash
+# Does the Service have endpoints? (are pods matching its selector?)
+kubectl get endpoints -n online-boutique
+# NAME           ENDPOINTS                    AGE
+# frontend       10.42.0.50:8080              5d   ← good, has pod IPs
+# cartservice    <none>                       5d   ← BAD — no pods matching selector
+
+# Check if the selector actually matches pod labels
+kubectl get svc frontend -n online-boutique -o jsonpath='{.spec.selector}'
+# {"app":"frontend"}
+
+kubectl get pods -n online-boutique -l app=frontend
+# If this returns nothing → the label on the pods is wrong
+
+# Test service connectivity from inside the cluster
+kubectl run test --image=busybox --restart=Never -it --rm -- \
+  wget -qO- http://frontend.online-boutique.svc.cluster.local:80
+# Use this temporary pod to test connectivity from inside the cluster
+# --rm means the pod deletes itself when you exit
+
+# Check DNS resolution
+kubectl run dns-test --image=busybox --restart=Never -it --rm -- \
+  nslookup frontend.online-boutique.svc.cluster.local
+```
+
+---
+
+### Debugging HPA (when it's not scaling)
+
+```bash
+# See the HPA status — what metrics it sees and what it decided
+kubectl get hpa -n online-boutique
+# NAME           REFERENCE         TARGETS         MINPODS   MAXPODS   REPLICAS
+# frontend-hpa   Deployment/frontend   8%/50%      1         5         1
+# targets shows: current/target — if current > target, it should scale up
+
+# Detailed view — shows the exact metric values and last scale event
+kubectl describe hpa frontend-hpa -n online-boutique
+
+# Common HPA problems:
+# "unknown" in TARGETS → metrics-server not running or pod has no resource requests
+kubectl get pods -n kube-system | grep metrics-server
+
+# HPA not scaling up → check if you're already at maxReplicas
+# HPA not scaling down → cooldown period (default 5 minutes)
+# HPA shows metrics but nothing happens → check minReplicas = maxReplicas
+```
+
+---
+
+### Debugging Storage (PVC issues)
+
+```bash
+# Check PVC status
+kubectl get pvc -n <namespace>
+# NAME     STATUS   VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+# data     Bound    pvc-xxx  10Gi       RWO            standard       5d   ← good
+# data     Pending  <none>   <none>     <none>         <none>         5m   ← BAD
+
+# Why is the PVC Pending?
+kubectl describe pvc <name> -n <namespace>
+# Common reasons:
+# "no persistent volumes available" → no PV matches the request
+# "storageclass not found" → wrong storageClassName in the PVC
+# "volume node affinity conflict" → PV is on a different node than where the pod needs to run
+
+# On k3s, check the local-path provisioner
+kubectl logs -n kube-system -l app=local-path-provisioner --tail=20
+```
+
+---
+
+### Debugging ArgoCD Sync Issues
+
+```bash
+# Check what ArgoCD thinks the state is
+kubectl get application -n argocd
+# NAME             SYNC STATUS   HEALTH STATUS
+# online-boutique  Synced        Healthy   ← good
+# monitoring       OutOfSync     Degraded  ← investigate
+
+# Why is it OutOfSync?
+kubectl describe application monitoring -n argocd
+# Look for: "message" field explaining the diff
+
+# Force ArgoCD to immediately re-check Git (don't wait 3 minutes)
+kubectl annotate application monitoring -n argocd \
+  argocd.argoproj.io/refresh=hard --overwrite
+
+# Check ArgoCD controller logs
+kubectl logs -n argocd deployment/argocd-application-controller --tail=30
+
+# The ArgoCD UI is the easiest way — shows the diff visually
+# http://63.184.235.88:30080
+```
+
+---
+
+### Debugging AlertManager — Alert Is Firing But Shouldn't Be
+
+```bash
+# Check what's currently firing
+# http://63.184.235.88:30031 → AlertManager UI
+
+# Check AlertManager config is loaded correctly
+kubectl exec -n monitoring alertmanager-monitoring-kube-prometheus-alertmanager-0 \
+  -- cat /etc/alertmanager/config/alertmanager.yaml
+
+# Check AlertManager logs
+kubectl logs -n monitoring alertmanager-monitoring-kube-prometheus-alertmanager-0 \
+  -c alertmanager --tail=20
+
+# Check the actual Prometheus alert rule
+kubectl get prometheusrule -n monitoring -o yaml | grep -A 10 "KubeSchedulerDown"
+
+# Add a silence (temporary suppression while you investigate)
+# In AlertManager UI: Silence → create silence → set matcher for alertname
+```
+
+---
+
+### The Kubernetes Troubleshooting Mental Model (One Sentence Per Rule)
+
+1. **Run events first.** `kubectl get events -A --sort-by=.lastTimestamp` tells you WHY before you even know what's broken.
+
+2. **Status tells you what, describe tells you why.** `get pods` shows the status; `describe pod` shows the reason.
+
+3. **`--previous` is essential for CrashLoopBackOff.** The current container already crashed; you need the logs from the run before it.
+
+4. **Requests are not usage.** A node at 99% requests with 15% usage will still refuse to schedule new pods.
+
+5. **Running doesn't mean healthy.** A pod can be Running and 0/1 Ready if its readiness probe is failing.
+
+6. **Empty endpoints mean selector mismatch.** If a Service has no endpoints, the labels on the pods don't match the Service selector.
+
+7. **ArgoCD health ≠ application health.** ArgoCD shows Degraded when a Kubernetes object is wrong; the application can still be serving traffic.
+
+8. **k3s false positive alerts are not incidents.** KubeSchedulerDown/ControllerManagerDown/ProxyDown on k3s are always false. Silence them on first setup.
+
+9. **ECR tokens expire after 12 hours.** New pods in a rolling update need to pull fresh images. Old pods keep running on cached images. ImagePullBackOff on new pods only = expired token.
+
+10. **When in doubt, reboot from AWS Console.** If the node is completely unresponsive (kubectl and SSH both hanging), stop and start the EC2 instance. ArgoCD will reconcile everything back automatically.
+
+---
+
 ## The One-Page Summary
 
 ```
