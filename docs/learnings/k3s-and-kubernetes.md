@@ -347,16 +347,325 @@ k9s --command pods    # open directly to pods view
 
 **k9s vs kubectl:** k9s is for exploration and debugging. kubectl is for scripted operations, CI/CD, and anything that needs to be repeatable. Both are used — k9s does not replace kubectl, it complements it.
 
+## The Kubernetes Debugging Framework — Outside-In Approach
+
+Every Kubernetes problem can be solved with the same approach: start at the highest level, drill down only when you know where the problem is. Never jump to conclusions.
+
+### The Golden Rule
+**Run the wide scan first. Then narrow down.**
+
+---
+
+### Layer 1 — Can I even reach the cluster?
+
+```bash
+kubectl get nodes
+```
+
+| Result | Meaning | Fix |
+|---|---|---|
+| `Ready` | All good — move to Layer 2 | — |
+| `NotReady` | Node is unhealthy | Check node resources, restart k3s |
+| TLS handshake timeout | Node is overloaded or API server is down | Reboot EC2 from AWS Console |
+| x509 certificate error | Wrong kubeconfig or missing TLS SAN | `echo $KUBECONFIG` → copy fresh kubeconfig |
+| Connection refused | k3s service crashed | SSH in → `sudo systemctl restart k3s` |
+
+---
+
+### Layer 2 — What is broken? (Run these two together — always)
+
+```bash
+kubectl get pods -A                                          # WHAT is broken (status column)
+kubectl get events -A --sort-by=.lastTimestamp | tail -30   # WHY it broke (reason + message)
+```
+
+**`kubectl get events` is often the fastest path to the answer.** It shows every scheduling decision, image pull attempt, crash, and resource failure across the whole cluster — sorted by time. Run it before `kubectl describe`, not after.
+
+**Read the pod STATUS column:**
+
+| Status | Plain English | Where to look next |
+|---|---|---|
+| `Pending` | Can't find a place to run | Node resources / HostPort conflict |
+| `CrashLoopBackOff` | Starting, crashing, repeating | `kubectl logs --previous` |
+| `ImagePullBackOff` / `ErrImagePull` | Can't get the container image | ECR token / IAM role / wrong tag |
+| `OOMKilled` | Memory limit exceeded, OS killed it | Increase memory limit |
+| `Error` | Crashed and stopped retrying | `kubectl logs` |
+| `Running` but 0/1 Ready | Container running but health check failing | Readiness probe / app not ready yet |
+| `Terminating` stuck | Pod won't shut down | `kubectl delete pod --force --grace-period=0` |
+
+---
+
+### Layer 3 — Why is it broken? (Drill into the problem)
+
+#### Pod problems:
+```bash
+# Full detail on a specific pod — ALWAYS read the Events section at the bottom
+kubectl describe pod <pod-name> -n <namespace>
+
+# What did the application say before it crashed?
+kubectl logs <pod-name> -n <namespace> --tail=50
+kubectl logs <pod-name> -n <namespace> --previous   # ← essential for CrashLoopBackOff
+```
+
+#### Scheduling / Pending problems:
+```bash
+# Is the node out of resources?
+kubectl describe node | grep -A 8 "Allocated resources"
+# CPU/Memory Requests near 100% = scheduling deadlock even if actual usage is low
+
+# What exact reason is stopping the pod from scheduling?
+kubectl describe pod <pod-name> -n <namespace>
+# Events will show: Insufficient cpu / Insufficient memory / HostPort conflict
+```
+
+#### Image pull problems:
+```bash
+kubectl describe pod <pod-name> -n <namespace>
+# Read the Events section for the exact error:
+# "no basic auth credentials"   → ECR token expired → refresh token
+# "manifest unknown"            → wrong image tag → check values.yaml
+# "repository does not exist"   → wrong ECR repo name
+# "pull access denied"          → IAM role missing ECR permissions
+```
+
+#### Networking problems (app runs but isn't reachable):
+```bash
+kubectl get svc -n <namespace>           # does the service exist? what type?
+kubectl get ingress -n <namespace>       # does the ingress rule exist?
+
+# Test connectivity from inside the cluster (most reliable)
+kubectl exec -it <any-running-pod> -n <namespace> -- wget -qO- http://<service>.<namespace>.svc.cluster.local:<port>
+# "ready" or HTML response = network is fine, problem is elsewhere
+# "connection refused" = service exists but pod isn't listening on that port
+# "no such host" = service name wrong or DNS issue
+```
+
+#### Resource / performance problems:
+```bash
+kubectl top pods -A            # actual real-time CPU and memory usage
+kubectl top nodes              # node-level actual usage
+kubectl describe node | grep -A 8 "Allocated resources"
+# Requests = what is RESERVED for scheduling (affects pod placement)
+# Limits = maximum a pod is ALLOWED to use
+# High Requests + Low actual usage = over-provisioned → reduce requests
+```
+
+---
+
+### Layer 4 — Confirm the fix worked
+
+```bash
+kubectl get pods -A                                        # everything Running?
+kubectl get events -A --sort-by=.lastTimestamp | tail -10  # no new Warnings?
+curl -I http://<your-ip>                                   # site actually responding?
+```
+
+---
+
+### The Complete Debugging Mind Map
+
+```
+SOMETHING IS WRONG
+│
+├── Can't reach cluster at all?
+│   └── kubectl get nodes → timeout / error
+│       ├── SSH also fails?   → Node is dead → Reboot from AWS Console
+│       ├── x509 error?       → Check $KUBECONFIG → copy fresh kubeconfig
+│       └── Connection refused → sudo systemctl restart k3s
+│
+└── Cluster reachable — what's broken?
+    └── kubectl get pods -A  +  kubectl get events -A
+        │
+        ├── PENDING
+        │   └── kubectl describe pod → Events section
+        │       ├── Insufficient cpu/memory → reduce requests or resize node
+        │       ├── HostPort conflict       → another pod owns that port
+        │       └── No nodes available      → taint or node selector mismatch
+        │
+        ├── CRASHLOOPBACKOFF
+        │   └── kubectl logs --previous → read the actual crash message
+        │       ├── OOMKilled           → increase memory limit
+        │       ├── Config/secret error → check mounted ConfigMaps/Secrets
+        │       └── Two defaults        → provisioning conflict (isDefault: true)
+        │
+        ├── IMAGEPULLBACKOFF
+        │   └── kubectl describe pod → Events → read the exact error
+        │       ├── no basic auth     → ECR token expired → refresh/cron job
+        │       ├── manifest unknown  → wrong image tag → check values.yaml
+        │       └── pull access denied → IAM role missing ECR permission
+        │
+        ├── RUNNING but site is down
+        │   ├── kubectl get svc     → service exists? right type?
+        │   ├── kubectl get ingress → routing rule exists?
+        │   └── exec into pod       → test connectivity with wget/curl
+        │
+        └── RUNNING and site is up but ALERTS firing
+            ├── kubectl get events -A → any Warnings?
+            ├── Check AlertManager UI → read exact alert name
+            └── Is it a k3s false positive? → silence it (see below)
+```
+
+---
+
+## k3s-Specific Quirks — What Bites You That Doesn't Exist on EKS
+
+These are issues that only occur on k3s and will not appear in standard Kubernetes documentation. Every one of these was hit in this project:
+
+### 1 — k3s False Positive Alerts
+
+`kube-prometheus-stack` ships with alert rules written for upstream Kubernetes. k3s combines scheduler, controller-manager, and kube-proxy into a **single binary** — there are no separate processes with individual metrics endpoints.
+
+Result: Prometheus fires `KubeSchedulerDown`, `KubeControllerManagerDown`, `KubeProxyDown` as **critical alerts permanently** on any k3s cluster.
+
+**Fix — silence them in AlertManager:**
+```yaml
+route:
+  routes:
+    - receiver: 'null'
+      matchers:
+        - alertname =~ "Watchdog|InfoInhibitor|KubeSchedulerDown|KubeControllerManagerDown|KubeProxyDown|etcdInsufficientMembers"
+```
+
+**Rule:** On k3s, always silence these four alerts on first setup. They are not real incidents.
+
+---
+
+### 2 — Traefik Owns Port 80 — LoadBalancer Services Conflict
+
+k3s installs Traefik by default as the ingress controller. Traefik's ServiceLB pod (`svclb-traefik`) binds **HostPort 80 and 443** on the node.
+
+If you create a `LoadBalancer` service on port 80, k3s's Klipper ServiceLB creates a DaemonSet pod that also tries to bind HostPort 80 — and gets stuck `Pending` forever because Traefik already owns it.
+
+```
+svclb-traefik-xxx          → Running  ← owns HostPort 80
+svclb-frontend-external-xxx → Pending  ← can't start, port taken
+```
+
+**The site works** because Traefik's Ingress routes traffic correctly. The LoadBalancer is redundant.
+
+**Fix:** Use `externalService: false` and expose via Traefik Ingress instead. One Ingress rule, one port owner, no conflicts:
+
+```yaml
+frontend:
+  externalService: false   # use Ingress, not LoadBalancer
+```
+
+---
+
+### 3 — ECR Token Expiry (containerd doesn't auto-refresh)
+
+containerd (k3s's runtime) does not use IAM roles automatically. The ECR token must be written explicitly to `/etc/rancher/k3s/registries.yaml`. ECR tokens expire after **12 hours**.
+
+**Symptom:** Pods that were Running keep running (cached images). New pods in a rolling update hit `ImagePullBackOff` with "no basic auth credentials".
+
+**Fix:** Cron job that refreshes every 6 hours using the IAM instance profile:
+```bash
+# /usr/local/bin/refresh-ecr-token.sh
+TOKEN=$(aws ecr get-login-password --region eu-central-1)
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+cat > /etc/rancher/k3s/registries.yaml << EOF
+configs:
+  "${ACCOUNT}.dkr.ecr.eu-central-1.amazonaws.com":
+    auth:
+      username: "AWS"
+      password: "${TOKEN}"
+EOF
+systemctl restart k3s
+
+# Cron (root crontab)
+0 */6 * * * /usr/local/bin/refresh-ecr-token.sh
+```
+
+---
+
+### 4 — kubeconfig Permissions Reset After Reboot
+
+k3s regenerates `/etc/rancher/k3s/k3s.yaml` on every boot with root-only permissions (0600). The `ubuntu` user cannot read it.
+
+**Symptom:** `kubectl get pods` returns permission denied after any reboot.
+
+**Fix:**
+```bash
+sudo chmod 644 /etc/rancher/k3s/k3s.yaml
+```
+
+**Permanent fix** — add `--write-kubeconfig-mode 644` to the k3s install command so permissions survive reboots.
+
+---
+
+### 5 — TLS Certificate Doesn't Include Public IP
+
+k3s generates its TLS certificate at install time. By default it only includes the node's private IP. Connecting kubectl from outside the VPC using the public Elastic IP fails with an x509 error.
+
+**Fix:** Pass `--tls-san <public-ip>` at install time. Cannot be added after — requires reinstall.
+
+```bash
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--tls-san 63.184.235.88" sh -
+```
+
+---
+
+### 6 — Ansible `creates:` Guard on k3s Install Task
+
+Without a guard, re-running the k3s Ansible playbook reinstalls k3s from scratch — wiping the entire cluster, all pods, all ArgoCD state.
+
+**Fix — add `args.creates:` to make the install task idempotent:**
+```yaml
+- name: Install k3s
+  shell: curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--tls-san 63.184.235.88" sh -
+  args:
+    creates: /usr/local/bin/k3s   # skip if binary already exists
+```
+
+---
+
+### Quick Reference — k3s Quirks at a Glance
+
+| Quirk | Symptom | Fix |
+|---|---|---|
+| Single binary (no separate scheduler/controller/proxy) | KubeSchedulerDown critical alerts permanently | Silence in AlertManager null route |
+| Traefik owns port 80 | LoadBalancer pod stuck Pending forever | Use Ingress, set `externalService: false` |
+| containerd needs explicit ECR credentials | ImagePullBackOff after 12 hours on rolling update | Cron job refreshing ECR token every 6h |
+| kubeconfig root-only permissions | kubectl permission denied after reboot | `chmod 644 /etc/rancher/k3s/k3s.yaml` |
+| TLS cert generated at install time | x509 error connecting remotely | Reinstall with `--tls-san <public-ip>` |
+| No idempotency guard on install task | Ansible playbook wipes entire cluster | `args.creates: /usr/local/bin/k3s` |
+
+---
+
 ## Interview Talking Points
 
+### Factual Points (what to say about the technology)
+
 - "k3s is a CNCF-certified Kubernetes distribution — fully compatible with upstream kubectl, Helm, and Kubernetes manifests, but packaged as a single binary and running under 512MB RAM at idle"
-- "I hit a TLS SAN error when connecting kubectl to k3s remotely — the self-signed certificate only covered the private IP, not the Elastic IP. The fix was to specify `--tls-san` at install time and reinstall — TLS certificates are generated once and cannot be patched in place"
+- "k3s combines the scheduler, controller-manager, and kube-proxy into a single binary — this means standard Prometheus alert rules for those components fire as false positives on k3s and need to be silenced"
+- "I hit a TLS SAN error when connecting kubectl to k3s remotely — the self-signed certificate only covered the private IP, not the Elastic IP. The fix was `--tls-san` at install time — TLS certificates are generated once and cannot be patched in place"
 - "kubeconfig must be re-copied every time k3s is reinstalled — the certificate-authority-data changes with each new cluster, and using the old kubeconfig produces authentication errors even if the server address is correct"
-- "I use k9s for day-to-day cluster navigation alongside kubectl — it shows CPU/memory per pod in real time and makes log tailing and pod inspection faster without replacing kubectl for scripted operations"
-- "kubectl on Windows was installed by downloading the .exe via WSL curl — PowerShell's Invoke-WebRequest had TLS and connection issues; WSL curl is more reliable for binary downloads"
-- "ReplicaSets are what Kubernetes uses to manage rolling updates — each new deployment creates a new RS and scales the old one down. Old RSes are kept at DESIRED=0 for rollback history. Rollback is just scaling the previous RS back up"
-- "We hit a rolling update deadlock on a single-node cluster — old ImagePullBackOff pods were consuming resource reservations, new pods couldn't schedule, and old pods wouldn't terminate until new ones were Ready. The solution is Recreate strategy on resource-constrained single nodes"
-- "Recreate strategy does not break rollback — rollback lives in the ReplicaSet definition stored in etcd, not in the running pods"
-- "containerd does not automatically use IAM credentials for ECR pulls — unlike Docker, containerd needs explicit registry configuration in /etc/rancher/k3s/registries.yaml. Without it, even a correctly configured IAM role produces 'no basic auth credentials'"
-- "Port-forward is a development debugging tool — it tunnels a local port through the Kubernetes API server and exits when the terminal closes. For permanent external access, LoadBalancer services or Ingress resources are the correct approach"
-- "In k3s, LoadBalancer services are handled by Klipper ServiceLB and Traefik — a LoadBalancer service on port 80 is automatically picked up by Traefik and exposed on the node's public IP"
+- "containerd does not automatically use IAM credentials for ECR pulls — it needs explicit registry configuration in `/etc/rancher/k3s/registries.yaml`. ECR tokens expire every 12 hours, so a cron job is required to keep them fresh"
+- "Port-forward is a development debugging tool, not a production access method — it tunnels a local port through the API server and exits when the terminal closes"
+- "ReplicaSets are what Kubernetes uses for rolling updates — each new deployment creates a new RS, scales it up, and scales the old RS down. Old RSes stay at DESIRED=0 for rollback history. Rollback is just scaling the previous RS back up"
+- "CPU requests and CPU usage are completely different things — requests are what Kubernetes reserves for scheduling decisions, usage is what's actually consumed. A node at 100% requests with 15% actual usage will refuse to schedule new pods"
+
+---
+
+### Scenario Questions (how to answer "what would you do if...")
+
+**"A pod is stuck in CrashLoopBackOff — walk me through your approach"**
+> "First I run `kubectl get events -A --sort-by=.lastTimestamp` to see if there's an immediate clue. Then `kubectl describe pod` to read the Events section. Then `kubectl logs --previous` — the `--previous` flag is essential because the current container has already crashed and restarted; I need the logs from the run before that. 99% of the time the actual error message is there."
+
+**"Deployments are stuck — nothing is rolling out"**
+> "I'd check node resource allocation first — `kubectl describe node` to see if CPU or memory requests are at 100%. If they are, Kubernetes can't place the new pod alongside the old one during the rolling update. Old pods won't terminate until new pods are Running, and new pods can't start because there's no room. The fix is either reducing requests to match actual observed usage from Prometheus metrics, or using Recreate strategy on single-node clusters."
+
+**"The site is down but all pods show Running"**
+> "`Running` means the container is alive — it doesn't mean it's healthy or reachable. I'd check the Service with `kubectl get svc`, then the Ingress with `kubectl get ingress`, then shell into a pod and test the connection directly with curl or wget to the service's cluster DNS name. That isolates whether the problem is the application, the Service layer, or the Ingress layer."
+
+**"How do you know if a node is about to run out of memory?"**
+> "Two separate commands — `kubectl top nodes` for actual real-time usage, and `kubectl describe node` for requests which are what's reserved for scheduling. If actual usage is at 85%+ you're approaching OOM kills. If requests are at 100% you'll get scheduling failures even if actual usage is low. Both matter for different reasons and they tell different stories."
+
+**"You're getting critical alerts that Kubernetes components are down — how do you respond?"**
+> "First I check if the cluster is actually healthy — `kubectl get nodes` and `kubectl get pods -A`. If everything is Running and the site is up, these are likely false positives. On k3s specifically, alerts like `KubeSchedulerDown` and `KubeControllerManagerDown` are permanent false positives because k3s combines those components into a single binary without the standard Prometheus scrape endpoints. The correct response is to silence them via AlertManager routing, not to treat them as real incidents."
+
+**"An ImagePullBackOff appeared after a rolling update — what do you check?"**
+> "`kubectl describe pod` to read the exact error from the Events section. Common causes: ECR token expired after 12 hours — the cron job should catch this but a one-time fix is refreshing the token and restarting k3s. Wrong image tag — Jenkins may have written a tag that doesn't exist in ECR yet. IAM role missing permissions — though this would fail on every pull, not just after 12 hours."
+
+**"How do you approach debugging Kubernetes issues in general?"**
+> "Outside-in. Start with `kubectl get nodes` to confirm the cluster is reachable. Then `kubectl get pods -A` and `kubectl get events -A --sort-by=.lastTimestamp` together — events is often faster than describe because it shows the reason across all namespaces in one view. Once I know which pod and what category of problem, I drill down with describe and logs. I never jump straight to logs without knowing which pod is actually failing first."
