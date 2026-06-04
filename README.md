@@ -3179,7 +3179,7 @@ In production, this pipeline means an engineer gets paged when something breaks 
 
 ---
 
-## Phase 5 — Security + Load Test *(in progress)*
+## Phase 5 — Security + Load Test ✅
 
 - [x] Integrate Trivy image scanning into Jenkins pipeline — scanning on every build
 - [x] Upgrade k3s node t3.medium → t3.large via AWS Console (in-place, preserves EBS volume and secrets)
@@ -3192,9 +3192,9 @@ In production, this pipeline means an engineer gets paged when something breaks 
 - [x] Fix ECR token expiry — added auto-refresh cron job to k3s Ansible playbook, token refreshes every 6 hours
 - [x] Fix k3s false positive alerts — KubeSchedulerDown, KubeControllerManagerDown, KubeProxyDown silenced via AlertManager null route
 - [x] Fix redundant frontend-external LoadBalancer — svclb HostPort 80 conflict with Traefik resolved, stuck Pending pod removed
-- [ ] Configure HPA — Horizontal Pod Autoscaler
-- [ ] Write k6 load test scripts and run under live traffic
-- [ ] Observe HPA scaling in real time in Grafana
+- [x] Configure HPA — frontend (max 3), cartservice (max 3), checkoutservice (max 2) at 50% CPU threshold
+- [x] k6 load test — 40 virtual users, 5040 requests, Prometheus remote write, Grafana dashboard 18030
+- [x] HPA scaling observed live — frontend hit 110% CPU → scaled 1→3 replicas, cartservice hit 63% → 1→3
 
 ---
 
@@ -3863,6 +3863,227 @@ Both changes committed and pushed to `cloudcommerce-devops`. ArgoCD synced withi
 **2 — Two ways to expose a service can coexist silently but only one works.** The Ingress and the LoadBalancer were both pointing at the frontend service. Only Traefik was actually serving traffic. The LoadBalancer appeared configured but its pod never ran — a silent failure that only became visible through AlertManager.
 
 **3 — ArgoCD health ≠ application availability.** ArgoCD showed "Degraded" because a pod wasn't Running. The application was serving real traffic the entire time. ArgoCD's health check looks at Kubernetes object state, not end-user experience. Both signals matter — ArgoCD health tells you about infrastructure state, a direct HTTP check tells you about user-facing availability.
+
+---
+
+### HPA + k6 Load Test — Autoscaling Under Real Traffic
+
+The final piece of the platform: Horizontal Pod Autoscaling under real traffic, with load test metrics flowing into Grafana alongside cluster metrics.
+
+---
+
+#### What is HPA?
+
+HPA (Horizontal Pod Autoscaler) watches CPU and memory usage on pods. When usage exceeds a threshold, it adds more pods. When usage drops, it removes them. This happens automatically — no human involvement.
+
+```
+Low traffic:    1 frontend pod handles everything
+                ↓
+k6 fires 40 virtual users
+                ↓
+frontend CPU crosses 50% of its request → HPA calculates: need 3 pods
+                ↓
+2 new pods: Pending → ContainerCreating → Running
+                ↓
+Traffic split across 3 pods — each pod works less hard
+                ↓
+k6 ramps down → CPU drops below threshold
+                ↓
+HPA waits 60 seconds (stabilisation window)
+                ↓
+Pods: 3 → 2 → 1  (scale-down)
+```
+
+---
+
+#### HPAs Configured
+
+Three services were chosen — the highest-traffic paths through the application:
+
+| Service | Min | Max | Trigger | Why |
+|---|---|---|---|---|
+| `frontend` | 1 | 3 | 50% CPU | Every user request hits this |
+| `cartservice` | 1 | 3 | 50% CPU | Every add-to-cart calls this |
+| `checkoutservice` | 1 | 2 | 50% CPU | Critical path, lower volume |
+
+**maxReplicas set to 3** — conservative for a single t3.large node (2 vCPUs). In production on a multi-node cluster, this would be 10+ with Cluster Autoscaler adding nodes automatically.
+
+The HPA template lives at `kubernetes/apps/online-boutique/templates/hpa.yaml` and is configured via `values.yaml` — fully GitOps managed through ArgoCD.
+
+![HPA template in VS Code](docs/screenshots/298-hpa-yaml-templates.png)
+*`hpa.yaml` in the Helm chart templates directory — three HPAs defined using Helm conditionals, pulling min/max/target values from values.yaml*
+
+![HPA behavior configuration](docs/screenshots/299-hpa-behavior-config.png)
+*The `behavior` section — scale-up is immediate (0s stabilisation), scale-down waits 60 seconds. This prevents thrashing: a single traffic spike won't create and destroy pods in rapid succession.*
+
+![values.yaml autoscaling section](docs/screenshots/300-values-yaml-autoscaling.png)
+*Autoscaling values in values.yaml — all numbers in one place. Change maxReplicas from 3 to 10 here and ArgoCD deploys the update. No template changes needed.*
+
+![kubectl get hpa showing all three live](docs/screenshots/301-hpa-live-kubectl.png)
+*`kubectl get hpa -n online-boutique` — all three HPAs live with real TARGETS values. `cpu: 24%/50%` on frontend means it's already at 24% utilisation from the loadgenerator — only needs a small push from k6 to trigger.*
+
+---
+
+#### k6 Load Test Setup
+
+k6 is a developer-focused load testing tool made by Grafana Labs. It integrates natively with Prometheus — k6 pushes its metrics directly into Prometheus, which Grafana reads. Load test results and cluster metrics appear on the same dashboard.
+
+**Why k6 and not JMeter:** k6 scripts are JavaScript (readable, version-controlled), integrate with the existing Grafana stack, and are the standard tool in modern cloud-native DevOps teams.
+
+**Prometheus remote write** was enabled by adding two lines to `kube-prometheus-stack-values.yaml`:
+```yaml
+prometheus:
+  service:
+    type: NodePort
+    nodePort: 30090
+  prometheusSpec:
+    enableRemoteWriteReceiver: true
+```
+
+Port 30090 was opened in the AWS security group so k6 (running in WSL) could reach Prometheus inside the cluster:
+
+![Security group port 30090 added](docs/screenshots/302-security-group-30090.png)
+*AWS EC2 Security Groups — Custom TCP port 30090 added. k6 writes metrics to http://63.184.235.88:30090/api/v1/write — Prometheus receives them and stores for Grafana.*
+
+The load test script (`scripts/k6-load-test.js`) simulates a realistic shopping session:
+
+```javascript
+// Each virtual user does this repeatedly:
+group('browse', function() {
+  http.get('/')                           // homepage — hits frontend
+  http.get('/product/<random-product>')   // product page — hits productcatalog, currency
+})
+
+group('cart', function() {
+  http.post('/cart', { product_id, quantity: '1' }) // add to cart — hits cartservice
+  http.get('/cart')                                  // view cart — hits cartservice + Redis
+})
+```
+
+**5 stages:**
+```
+30s  →  5 users   (warm up)
+60s  →  20 users  (crosses HPA threshold)
+90s  →  40 users  (maximum pressure — both frontend and cartservice HPAs fire)
+30s  →  20 users  (partial cooldown)
+60s  →  0 users   (full cooldown — watch scale-down)
+```
+
+![k9s before the test — 1 replica of each service](docs/screenshots/303-k9s-before-k6-test.png)
+*k9s showing online-boutique namespace before k6 runs — 1 replica of frontend, 1 of cartservice. This is the baseline.*
+
+---
+
+#### Running the Test
+
+```bash
+K6_PROMETHEUS_RW_SERVER_URL=http://63.184.235.88:30090/api/v1/write \
+k6 run --out experimental-prometheus-rw scripts/k6-load-test.js
+```
+
+![k6 test running in WSL terminal](docs/screenshots/304-k6-test-running.png)
+*k6 running — 40 max VUs, output connected to Prometheus remote write at port 30090. The progress bar shows stages advancing.*
+
+---
+
+#### Results — k6 Dashboard in Grafana
+
+Grafana dashboard **18030** (k6 Prometheus) was imported to visualise the load test results alongside cluster metrics:
+
+![k6 Prometheus graph in Grafana](docs/screenshots/305-k6-prometheus-graph.png)
+*Grafana k6 dashboard — VU count climbing through the stages, request rate rising, response times visible*
+
+![k6 results — 5040 requests, 240 failures](docs/screenshots/306-k6-results-5040-requests.png)
+*Test summary: 5040 total requests, 240 failures (4.8% — just under the 5% failure threshold). Peak RPS: 2.79 req/s across 40 virtual users.*
+
+![k6 check success rates](docs/screenshots/307-k6-checks-success-rates.png)
+*Per-check success rates: homepage 100%, cart view 100%, add-to-cart 90.5%. The 9.5% cart failures occurred at peak load when the service was at maximum capacity — the application degraded gracefully rather than crashing.*
+
+---
+
+#### HPA Firing — The Evidence
+
+With load running, Prometheus metrics showed the CPU crossing the 50% threshold:
+
+![Grafana CPU and memory during load test](docs/screenshots/308-grafana-cpu-memory-during-load.png)
+*Grafana Kubernetes namespace dashboard — CPU utilisation visible across all online-boutique pods during the load test. Multiple pods now visible for frontend and cartservice.*
+
+![frontend CPU hit 110% — HPA fires](docs/screenshots/309-hpa-frontend-110-percent.png)
+*`kubectl get hpa -w` — `frontend cpu: 110%/50%` REPLICAS: 3. The frontend CPU exceeded double the threshold. HPA calculated: `ceil(1 × 110/50) = 3` replicas needed. Two new pods created immediately.*
+
+![cartservice CPU 63% — scaled to 3 replicas](docs/screenshots/310-hpa-cartservice-63-replicas.png)
+*cartservice at 63%/50% → also scaled to 3 replicas. Every add-to-cart request from 40 virtual users was hitting this service simultaneously.*
+
+---
+
+#### Live in k9s — Pods Appearing and Disappearing
+
+The most direct evidence of HPA working: watching pods appear in k9s in real time.
+
+![k9s cartservice scaling — new pods appearing](docs/screenshots/313-k9s-cartservice-scaling.png)
+*k9s during load test — cartservice showing 3 pods: the original (AGE: 2d) and two new pods (AGE: under 2 minutes). The new pods appeared as Pending → ContainerCreating → Running while k6 was running.*
+
+![k9s frontend scaling — 3 pods running](docs/screenshots/314-k9s-frontend-scaling.png)
+*k9s frontend — 3 pods Running, each showing different CPU utilisation. The original pod had the highest CPU (it was running before the others joined). New pods started fresh at low utilisation.*
+
+![k9s CPU and memory numbers during scaling](docs/screenshots/315-k9s-resources-scaling.png)
+*k9s resource columns during peak load — CPU%, memory, and request percentage visible for every pod simultaneously. The load is visibly distributed across the scaled pods.*
+
+---
+
+#### Scale-Down — The HPA Cleaning Up
+
+After k6 finished ramping down:
+
+![k6 ramp-down phase](docs/screenshots/311-k6-rampdown.png)
+*k6 terminal showing the ramp-down stage — VUs dropping from 40 → 20 → 0. CPU on the cluster begins dropping.*
+
+![pods scaling down in k9s](docs/screenshots/316-k9s-pods-scaling-down.png)
+*k9s showing pods entering Terminating state — HPA detected CPU below threshold for 60 seconds (stabilisation window) and began removing the extra replicas. One by one, back to 1.*
+
+---
+
+#### Single-Node Constraint — What This Demonstrates vs Production
+
+On this single-node k3s cluster, all new pods land on the same EC2 instance (`ip-10-0-1-23`). True horizontal scaling means distributing pods across multiple nodes — that's where the performance benefit comes from. What this demonstrates is the **Kubernetes autoscaling mechanism** working correctly end-to-end.
+
+In production on EKS with multiple nodes:
+```
+HPA: "I need 3 frontend pods"
+Scheduler: distributes pods across nodes (eu-central-1a, 1b, 1c)
+Cluster Autoscaler: adds a new node if existing ones are full
+Result: true horizontal scaling with real load distribution
+```
+
+The configuration, the HPA objects, the threshold logic, and the GitOps delivery are identical. The node topology is what changes at scale.
+
+---
+
+#### The Full Autoscaling Pipeline
+
+```
+k6 fires 40 virtual users at http://63.184.235.88
+    ↓
+Frontend receives requests → CPU climbs past 50% of request
+    ↓
+metrics-server reports actual usage to HPA controller every 15s
+    ↓
+HPA calculates: ceil(currentReplicas × currentCPU/targetCPU) = 3
+    ↓
+HPA updates Deployment: replicas: 3
+    ↓
+Deployment controller creates 2 new ReplicaSets pods
+    ↓
+Scheduler places pods on ip-10-0-1-23 (only node available)
+    ↓
+kubelet pulls images from ECR (token valid — cron job refreshed it)
+    ↓
+Pods reach Running + readiness probe passes
+    ↓
+Service endpoints updated — traffic distributed across 3 pods
+    ↓
+k6 ramps down → CPU drops → HPA stabilises for 60s → scales back to 1
+```
 
 ---
 
