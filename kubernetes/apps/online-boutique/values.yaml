@@ -226,3 +226,30 @@ cartDatabase:
 shoppingAssistantService:
   create: false
   name: shoppingassistantservice
+
+# Horizontal Pod Autoscaling
+# HPA scales pods when CPU utilisation exceeds targetCPUUtilizationPercentage
+# of the pod's CPU request. Requires metrics-server (pre-installed in k3s).
+#
+# Example: frontend requests 50m CPU, target is 50%
+# → HPA scales up when actual usage > 25m (50% of 50m)
+# → On a single node, all extra pods land on ip-10-0-1-23
+# → maxReplicas kept at 3 to stay within node CPU headroom
+autoscaling:
+  frontend:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 50
+
+  cartService:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 50
+
+  checkoutService:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 2
+    targetCPUUtilizationPercentage: 50

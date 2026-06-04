@@ -1,0 +1,114 @@
+# Horizontal Pod Autoscalers
+# Scales pods up when CPU utilisation exceeds the target percentage.
+# HPA reads actual CPU usage from metrics-server and compares against
+# the pod's CPU request. When usage / request > target, new pods are added.
+#
+# Single-node note: all new pods land on the same node (ip-10-0-1-23).
+# HPA demonstrates the Kubernetes autoscaling mechanism correctly.
+# In production (multi-node), new pods distribute across nodes for
+# real horizontal scaling.
+
+{{- if .Values.autoscaling.frontend.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frontend
+  namespace: {{ .Release.Namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ .Values.frontend.name }}
+  minReplicas: {{ .Values.autoscaling.frontend.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.frontend.maxReplicas }}
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: {{ .Values.autoscaling.frontend.targetCPUUtilizationPercentage }}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0      # scale up immediately when threshold crossed
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 30                # add at most 1 pod every 30 seconds
+    scaleDown:
+      stabilizationWindowSeconds: 60     # wait 60s of low usage before scaling down
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 60                # remove at most 1 pod per minute
+{{- end }}
+---
+{{- if .Values.autoscaling.cartService.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cartservice
+  namespace: {{ .Release.Namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ .Values.cartService.name }}
+  minReplicas: {{ .Values.autoscaling.cartService.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.cartService.maxReplicas }}
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: {{ .Values.autoscaling.cartService.targetCPUUtilizationPercentage }}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 60
+{{- end }}
+---
+{{- if .Values.autoscaling.checkoutService.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: checkoutservice
+  namespace: {{ .Release.Namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ .Values.checkoutService.name }}
+  minReplicas: {{ .Values.autoscaling.checkoutService.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.checkoutService.maxReplicas }}
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: {{ .Values.autoscaling.checkoutService.targetCPUUtilizationPercentage }}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 60
+{{- end }}
