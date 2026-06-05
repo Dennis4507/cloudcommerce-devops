@@ -1,8 +1,9 @@
 # CloudCommerce DevOps Platform
 
-A production-grade DevOps platform built around Google's Online Boutique — a 12-microservice e-commerce application written in Go, Python, Java, C#, and Node.js. This project was built from scratch to demonstrate real-world DevOps engineering: architectural decisions, security design, infrastructure automation, CI/CD pipelines, Kubernetes orchestration, and full-stack observability.
+This is A DevOps platform built around Google's Online Boutique — a 12-microservice e-commerce application written in Go, Python, Java, C#, and Node.js. This project was built from scratch: Included in this project are architectural decisions, security design, infrastructure automation, CI/CD pipelines, Kubernetes orchestration, and full-stack observability.
 
-> This is not a tutorial follow-along. Every decision in this project was made deliberately, with a specific reason, and is documented here alongside the evidence that it was implemented.
+> Follow-along and see the decision i made in this project, and the specific reasons and i have tried to document it all here alongside screenshots and evidence on how it was all implemented
+with a specific reason, and is documented here alongside the evidence that it was implemented.
 
 **Application source:** [Google Online Boutique](https://github.com/GoogleCloudPlatform/microservices-demo)
 
@@ -10,7 +11,7 @@ A production-grade DevOps platform built around Google's Online Boutique — a 1
 
 ## Why This Project Exists
 
-Most DevOps portfolios deploy a single containerised application to a managed Kubernetes service and call it done. This project takes a different approach: build the entire platform from scratch — networking, identity, compute, CI/CD, orchestration, and observability — making real engineering decisions along the way and documenting every one of them.
+In this Project we will build an entire platform from scratch — networking, identity, compute, CI/CD, orchestration, and observability — making design decisions along the way and documenting every one of them.
 
 The goals are:
 - Design and provision a complete AWS infrastructure using Infrastructure as Code
