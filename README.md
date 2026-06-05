@@ -23,36 +23,9 @@ The goals are:
 
 ## Architecture
 
-```
-Developer pushes code to GitHub
-         │
-         ▼ webhook
-    ┌─────────────┐
-    │   Jenkins   │  ← CI/CD on EC2 t3.medium (eu-central-1)
-    │  Pipeline   │    Build → Scan → Push → Update values.yaml
-    └──────┬──────┘
-           │ triggers ArgoCD sync
-           ▼
-    ┌─────────────┐         ┌──────────────────────────┐
-    │   ArgoCD    │────────►│     k3s Kubernetes       │
-    │  (GitOps)   │  sync   │     EC2 t3.medium        │
-    └─────────────┘         │                          │
-                            │  12 Microservices        │
-                            │  Prometheus + Grafana    │
-                            │  Loki + Promtail         │
-                            │  k9s (terminal dashboard)│
-                            └────────────┬─────────────┘
-                                         │
-                        ┌────────────────┼──────────────┐
-                        ▼                ▼               ▼
-                  ┌──────────┐   ┌────────────┐  ┌────────────┐
-                  │ AWS ECR  │   │   AWS S3   │  │  Route53   │
-                  │ 12 Repos │   │ TF State   │  │    DNS     │
-                  └──────────┘   └────────────┘  └────────────┘
+![CloudCommerce Full Architecture](docs/cloudcommerce_architecture.png)
 
-     All infrastructure provisioned with Terraform
-     All server configuration managed with Ansible
-```
+**Diagram key:** 🟠 CI pipeline &nbsp;|&nbsp; 🟢 GitOps / deploy &nbsp;|&nbsp; 🟣 Metrics &nbsp;|&nbsp; 🔵 Log shipping &nbsp;|&nbsp; ⬜ IaC / infrastructure &nbsp;|&nbsp; 🔷 Network routing
 
 ---
 
